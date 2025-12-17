@@ -1,30 +1,50 @@
 """
 NoiseInject - A framework for testing ML model robustness to label noise
-
-Example workflow:
-    >>> from noiseInject import NoiseInjector, calculate_noise_metrics, calibrate_sigma
-    >>> 
-    >>> # 1. Calibrate sigma for fair comparison
-    >>> sigma = calibrate_sigma(y_train, target_effective_noise=0.1)
-    >>> 
-    >>> # 2. Inject noise
-    >>> injector = NoiseInjector(strategy='legacy')
-    >>> y_noisy = injector.inject(y_train, sigma)
-    >>> 
-    >>> # 3. Train your model
-    >>> model.fit(X_train, y_noisy)
-    >>> 
-    >>> # 4. Analyze robustness
-    >>> predictions = {
-    ...     0.0: model_baseline.predict(X_test),
-    ...     0.1: model_noisy.predict(X_test)
-    ... }
-    >>> metrics = calculate_noise_metrics(y_test, predictions)
+Supports both regression (continuous noise) and classification (label flips)
 """
 
-from .core import NoiseInjector
-from .metrics import calculate_noise_metrics
-from .calibration import calibrate_sigma, calibrate_multiple_sigmas
+from .core import (
+    NoiseInjectorRegression,
+    NoiseInjectorClassification,
+)
 
-__version__ = '0.1.0'
-__all__ = ['NoiseInjector', 'calculate_noise_metrics', 'calibrate_sigma', 'calibrate_multiple_sigmas']
+from .calibration import (
+    # Regression calibration
+    calibrate_sigma,
+    calibrate_multiple_sigmas,
+    # Classification calibration
+    calibrate_flip_probability,
+    calibrate_multiple_flip_probabilities
+)
+
+from .metrics import (
+    # Regression metrics
+    calculate_noise_metrics,
+    # Classification metrics
+    calculate_classification_metrics,
+    calculate_confusion_matrix_metrics,
+    get_most_robust_classes,
+    get_least_robust_classes
+)
+
+__version__ = '0.2.0'
+
+__all__ = [
+    # Core classes
+    'NoiseInjectorRegression',
+    'NoiseInjectorClassification',
+    'NoiseInjector',
+    # Regression calibration
+    'calibrate_sigma',
+    'calibrate_multiple_sigmas',
+    # Classification calibration
+    'calibrate_flip_probability',
+    'calibrate_multiple_flip_probabilities',
+    # Regression metrics
+    'calculate_noise_metrics',
+    # Classification metrics
+    'calculate_classification_metrics',
+    'calculate_confusion_matrix_metrics',
+    'get_most_robust_classes',
+    'get_least_robust_classes',
+]

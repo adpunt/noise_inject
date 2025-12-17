@@ -19,7 +19,7 @@ from torch_geometric.datasets import QM9
 import torch
 import os.path as osp
 
-from noiseInject import NoiseInjector, calculate_noise_metrics, calibrate_sigma
+from noiseInject import NoiseInjectorRegression, calculate_noise_metrics, calibrate_sigma
 
 # Disable multiprocessing to avoid segfaults
 torch.set_num_threads(1)
@@ -192,7 +192,7 @@ def test_noise_robustness(X_train, y_train, X_test, y_test,
     
     # Step 1: Calibrate sigma for fair comparison
     print("\n1. Calibrating sigma for 10% effective noise...")
-    injector = NoiseInjector(strategy=strategy, random_state=42)
+    injector = NoiseInjectorRegression(strategy=strategy, random_state=42)
     sigma_cal = calibrate_sigma(y_train, target_effective_noise=0.1, 
                                 strategy=strategy, random_state=42)
     print(f"   Calibrated sigma: {sigma_cal:.4f}")
@@ -214,7 +214,8 @@ def test_noise_robustness(X_train, y_train, X_test, y_test,
             y_train_noisy = injector.inject(y_train, sigma)
         
         # Train model
-        model = xgb.XGBRegressor(n_estimators=100, random_state=42, n_jobs=1)
+        from xgboost import XGBRegressor
+        model = XGBRegressor(n_estimators=100, random_state=42, n_jobs=1)
         model.fit(X_train, y_train_noisy)
         
         # Predict on clean test set

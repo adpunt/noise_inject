@@ -21,7 +21,7 @@ from sklearn.model_selection import train_test_split
 from rdkit import Chem, RDLogger
 import deepchem as dc
 
-from noiseInject import NoiseInjector, calculate_noise_metrics, calibrate_sigma
+from noiseInject import NoiseInjectorRegression, calculate_noise_metrics, calibrate_sigma
 
 # Disable warnings and multiprocessing issues
 RDLogger.DisableLog('rdApp.*')
@@ -215,7 +215,7 @@ def test_moleculenet_robustness():
     
     # Calibrate sigma for 10% effective noise
     print("\nCalibrating sigma...")
-    injector = NoiseInjector('legacy', random_state=42)
+    injector = NoiseInjectorRegression('legacy', random_state=42)
     sigma_cal = calibrate_sigma(y_train, target_effective_noise=0.1, random_state=42)
     print(f"Calibrated sigma: {sigma_cal:.4f}")
     
@@ -294,7 +294,7 @@ def compare_noise_strategies():
     
     for strategy in strategies:
         print(f"\nTesting {strategy.upper()} strategy...")
-        injector = NoiseInjector(strategy, random_state=42)
+        injector = NoiseInjectorRegression(strategy, random_state=42)
         
         # Calibrate
         sigma = calibrate_sigma(y_train, 0.1, strategy=strategy, random_state=42)

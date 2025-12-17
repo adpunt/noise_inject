@@ -18,7 +18,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.datasets import fetch_california_housing
 import os
 
-from noiseInject import NoiseInjector, calculate_noise_metrics, calibrate_sigma
+from noiseInject import NoiseInjectorRegression, calculate_noise_metrics, calibrate_sigma
 
 # Disable multiprocessing
 os.environ['OMP_NUM_THREADS'] = '1'
@@ -97,7 +97,7 @@ def analyze_model_robustness(X_train, y_train, X_test, y_test,
     
     # Calibrate sigma
     print("\n1. Calibrating sigma for 10% effective noise...")
-    injector = NoiseInjector('legacy', random_state=42)
+    injector = NoiseInjectorRegression('legacy', random_state=42)
     sigma_cal = calibrate_sigma(y_train, target_effective_noise=0.1, random_state=42)
     print(f"   Calibrated σ = {sigma_cal:.4f}")
     
@@ -222,7 +222,7 @@ def compare_strategies(X_train, y_train, X_test, y_test, model=None):
     for strategy in strategies:
         print(f"\n{strategy.upper()} strategy...")
         
-        injector = NoiseInjector(strategy, random_state=42)
+        injector = NoiseInjectorRegression(strategy, random_state=42)
         
         # Calibrate
         sigma = calibrate_sigma(y_train, 0.1, strategy=strategy, random_state=42)
