@@ -155,14 +155,17 @@ class NoiseInjectorRegression:
         return y + noise
     
     def _valprop(self, y: np.ndarray, sigma: float,
-                 proportionality_factor: float = 0.1) -> np.ndarray:
+                 proportionality_factor: float = 0.05) -> np.ndarray:
         """
-        Value-proportional: σ_i = base_sigma + prop_factor * |y_i|
-        
+        Value-proportional: σ_i = base_sigma * (1 + prop_factor * |y_i|)
+
+        Noise variance scales multiplicatively with the absolute target value,
+        so larger targets receive proportionally more noise.
+
         Args:
-            proportionality_factor: Proportionality to absolute value (default 0.1)
+            proportionality_factor: Proportionality to absolute value (default 0.05)
         """
-        sigma_values = sigma + proportionality_factor * np.abs(y)
+        sigma_values = sigma * (1 + proportionality_factor * np.abs(y))
         noise = self.rng.normal(0, 1, size=len(y)) * sigma_values
         return y + noise
     
