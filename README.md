@@ -1,9 +1,8 @@
 # NoiseInject
 
-<!-- Badges: fill the Zenodo DOI after the first GitHub release (see research/noiseinject_vs_jcheminform.md, Part 3) -->
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 ![Python](https://img.shields.io/badge/python-3.7%2B-blue.svg)
-<!-- [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.XXXXXXX.svg)](https://doi.org/10.5281/zenodo.XXXXXXX) -->
+[![DOI](https://zenodo.org/badge/1117122976.svg)](https://doi.org/10.5281/zenodo.20531238)
 
 A lightweight Python framework for testing ML model robustness to label noise in both **regression** and **classification** tasks.
 
@@ -117,9 +116,17 @@ If you use NoiseInject in your research, please cite the paper and the archived 
   year    = {2026},
   note    = {Software: https://github.com/adpunt/noise_inject}
 }
-```
 
-<!-- After the first Zenodo release, add a second @software{...} entry with the DOI. -->
+@software{punt_noiseinject_software,
+  title     = {NoiseInject: A Framework for Label Noise Robustness Testing},
+  author    = {Punt, Adelaide},
+  year      = {2026},
+  publisher = {Zenodo},
+  version   = {v0.2.0},
+  doi       = {10.5281/zenodo.20531238},
+  url       = {https://doi.org/10.5281/zenodo.20531238}
+}
+```
 
 ## License
 

@@ -7,8 +7,8 @@ authors:
     affiliation: University of Oxford
 title: "NoiseInject: A Framework for Label Noise Robustness Testing"
 version: 0.2.0
-# doi: "10.5281/zenodo.XXXXXXX"   # TODO: paste the Zenodo concept DOI after first release
-# date-released: 2026-06-03       # TODO: set to the release date
+doi: "10.5281/zenodo.20531238"
+date-released: 2026-06-03
 url: "https://github.com/adpunt/noise_inject"
 preferred-citation:
   type: article
