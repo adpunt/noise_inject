@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 ![Python](https://img.shields.io/badge/python-3.7%2B-blue.svg)
-[![DOI](https://zenodo.org/badge/1117122976.svg)](https://doi.org/10.5281/zenodo.20531238)
+[![DOI](https://zenodo.org/badge/1117122976.svg)](https://doi.org/10.5281/zenodo.20532710)
 
 A lightweight Python framework for testing ML model robustness to label noise in both **regression** and **classification** tasks.
 
@@ -146,8 +146,8 @@ If you use NoiseInject in your research, please cite the paper and the archived 
   year      = {2026},
   publisher = {Zenodo},
   version   = {v0.3.0},
-  doi       = {10.5281/zenodo.20531238},
-  url       = {https://doi.org/10.5281/zenodo.20531238}
+  doi       = {10.5281/zenodo.20532710},
+  url       = {https://doi.org/10.5281/zenodo.20532710}
 }
 ```
 
