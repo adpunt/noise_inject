@@ -145,7 +145,7 @@ If you use NoiseInject in your research, please cite the paper and the archived 
   author    = {Punt, Adelaide},
   year      = {2026},
   publisher = {Zenodo},
-  version   = {v0.2.0},
+  version   = {v0.3.0},
   doi       = {10.5281/zenodo.20531238},
   url       = {https://doi.org/10.5281/zenodo.20531238}
 }
