@@ -334,17 +334,19 @@ class NoiseInjectorClassification:
         
         class_0 = unique_classes[0]
         class_1 = unique_classes[1]
-        
-        mask_0 = (y == class_0)
+
+        # Use integer indices: chained boolean indexing (y_noisy[mask][submask] = ...)
+        # assigns into a copy and silently does nothing.
+        idx_0 = np.where(y == class_0)[0]
         flip_prob_01 = min(1.0, max(0.0, flip_probability * flip_01_mult))
-        flip_mask_01 = self.rng.rand(np.sum(mask_0)) < flip_prob_01
-        y_noisy[mask_0][flip_mask_01] = class_1
-        
-        mask_1 = (y == class_1)
+        flip_mask_01 = self.rng.rand(len(idx_0)) < flip_prob_01
+        y_noisy[idx_0[flip_mask_01]] = class_1
+
+        idx_1 = np.where(y == class_1)[0]
         flip_prob_10 = min(1.0, max(0.0, flip_probability * flip_10_mult))
-        flip_mask_10 = self.rng.rand(np.sum(mask_1)) < flip_prob_10
-        y_noisy[mask_1][flip_mask_10] = class_0
-        
+        flip_mask_10 = self.rng.rand(len(idx_1)) < flip_prob_10
+        y_noisy[idx_1[flip_mask_10]] = class_0
+
         return y_noisy
     
     def _instance_noise(self, y: np.ndarray, flip_probability: float,

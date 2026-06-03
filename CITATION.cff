@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+  - family-names: Punt
+    given-names: Adelaide
+    # orcid: "https://orcid.org/0000-0000-0000-0000"  # TODO: add your ORCID
+    affiliation: University of Oxford
+title: "NoiseInject: A Framework for Label Noise Robustness Testing"
+version: 0.2.0
+# doi: "10.5281/zenodo.XXXXXXX"   # TODO: paste the Zenodo concept DOI after first release
+# date-released: 2026-06-03       # TODO: set to the release date
+url: "https://github.com/adpunt/noise_inject"
+preferred-citation:
+  type: article
+  authors:
+    - family-names: Punt
+      given-names: Adelaide
+  title: "NoiseInject: Systematic evaluation of model robustness to label noise in cheminformatics"
+  journal: "Journal of Cheminformatics"
+  year: 2026

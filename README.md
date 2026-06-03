@@ -1,5 +1,10 @@
 # NoiseInject
 
+<!-- Badges: fill the Zenodo DOI after the first GitHub release (see research/noiseinject_vs_jcheminform.md, Part 3) -->
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+![Python](https://img.shields.io/badge/python-3.7%2B-blue.svg)
+<!-- [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.XXXXXXX.svg)](https://doi.org/10.5281/zenodo.XXXXXXX) -->
+
 A lightweight Python framework for testing ML model robustness to label noise in both **regression** and **classification** tasks.
 
 ## Installation
@@ -91,7 +96,10 @@ print(f"Retention: {summary_df['retention_pct_accuracy'].values[0]:.1f}%")
 
 ## Examples
 
-See `examples/` directory:
+Runnable notebooks in `notebooks/`:
+- `01_quickstart.ipynb` - Regression + classification end-to-end (public sklearn data, no extra deps)
+
+Scripts in `examples/`:
 - `generic_dataset.py` - Any regression dataset
 - `qm9_pdv.py` - QM9 molecular properties
 - `moleculenet_gnn.py` - MoleculeNet with GNN embeddings
@@ -99,8 +107,19 @@ See `examples/` directory:
 
 ## Citation
 
-If you use NoiseInject in your research, please cite:
-[Your paper citation]
+If you use NoiseInject in your research, please cite the paper and the archived software:
+
+```bibtex
+@article{punt2026noiseinject,
+  title   = {NoiseInject: Systematic evaluation of model robustness to label noise in cheminformatics},
+  author  = {Punt, Adelaide},
+  journal = {Journal of Cheminformatics},
+  year    = {2026},
+  note    = {Software: https://github.com/adpunt/noise_inject}
+}
+```
+
+<!-- After the first Zenodo release, add a second @software{...} entry with the DOI. -->
 
 ## License
 

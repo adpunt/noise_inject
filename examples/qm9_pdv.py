@@ -91,7 +91,7 @@ def smiles_to_pdv(smiles_string):
         calculator = MolecularDescriptorCalculator(DEFAULT_DESCRIPTOR_LIST)
         descriptors = calculator.CalcDescriptors(mol)
         return np.array(descriptors)
-    except:
+    except Exception:
         return None
 
 
