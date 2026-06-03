@@ -1,0 +1,7 @@
+# Core runtime dependencies for NoiseInject (mirrors install_requires in setup.py).
+# Example scripts/notebooks additionally need the "examples" extras (see setup.py):
+# rdkit, torch, torch-geometric, xgboost, deepchem.
+numpy>=1.19.0
+pandas>=1.1.0
+scipy>=1.5.0
+scikit-learn>=0.24.0
