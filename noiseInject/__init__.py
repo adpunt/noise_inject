@@ -27,6 +27,8 @@ from .metrics import (
     get_least_robust_classes
 )
 
+from .uncertainty import calculate_uncertainty_metrics
+
 __version__ = '0.2.0'
 
 __all__ = [
@@ -47,4 +49,6 @@ __all__ = [
     'calculate_confusion_matrix_metrics',
     'get_most_robust_classes',
     'get_least_robust_classes',
+    # Uncertainty metrics
+    'calculate_uncertainty_metrics',
 ]

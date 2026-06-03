@@ -9,8 +9,8 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="noiseInject",
-    version="0.1.0",
-    author="Adelaide",
+    version="0.2.0",
+    author="Adelaide Punt",
     description="Framework for testing ML model robustness to label noise",
     long_description=long_description,
     long_description_content_type="text/markdown",
@@ -41,6 +41,11 @@ setup(
             "xgboost>=1.5.0",
             "deepchem>=2.6.0",
         ],
+        "uncertainty": [
+            "torch>=1.9.0",
+            "gpytorch>=1.9.0",
+            "gauche>=0.1.0",
+        ],
         "all": [
             "rdkit>=2020.09.1",
             "torch>=1.9.0",
@@ -48,6 +53,8 @@ setup(
             "scikit-learn>=0.24.0",
             "xgboost>=1.5.0",
             "deepchem>=2.6.0",
+            "gpytorch>=1.9.0",
+            "gauche>=0.1.0",
         ],
     },
 )

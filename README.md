@@ -85,6 +85,28 @@ print(f"Retention: {summary_df['retention_pct_accuracy'].values[0]:.1f}%")
 - **Retention**: Performance preservation at high noise. Higher = more robust.
 - **Baseline**: Performance with clean labels (σ=0 or flip_prob=0).
 
+## Uncertainty Quantification
+
+For probabilistic models, `calculate_uncertainty_metrics` tracks how well predicted
+uncertainty stays calibrated across noise levels: uncertainty–error and uncertainty–noise
+Spearman correlations, coverage at 1σ/2σ, ECE, and mean interval width.
+
+```python
+from noiseInject import calculate_uncertainty_metrics
+
+# predictions[sigma] -> mean,  uncertainties[sigma] -> per-sample predicted std
+per_sigma_df, summary_df = calculate_uncertainty_metrics(y_test, predictions, uncertainties)
+```
+
+Optional model wrappers that *produce* per-sample uncertainty (install via
+`pip install noiseInject[uncertainty]`):
+
+- `SplitConformalRegressor` - distribution-free intervals around any sklearn model (no extra deps)
+- `GaucheGPRegressor` - Gaussian process with Tanimoto/RBF kernels (gpytorch + gauche)
+- `MCDropoutRegressor` - Monte Carlo dropout for any PyTorch network
+
+See `notebooks/02_uncertainty.ipynb` for a worked example.
+
 ## Features
 
 ✓ Model-agnostic (works with any sklearn-compatible model)  
@@ -97,6 +119,7 @@ print(f"Retention: {summary_df['retention_pct_accuracy'].values[0]:.1f}%")
 
 Runnable notebooks in `notebooks/`:
 - `01_quickstart.ipynb` - Regression + classification end-to-end (public sklearn data, no extra deps)
+- `02_uncertainty.ipynb` - Tracking uncertainty calibration under noise with NGBoost (ECE, coverage, uncertainty–error/noise correlation)
 
 Scripts in `examples/`:
 - `generic_dataset.py` - Any regression dataset
