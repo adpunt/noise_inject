@@ -63,112 +63,154 @@ class NoiseInjectorRegression:
         elif self.strategy == 'valprop':
             return self._valprop(y, sigma, **strategy_params)
     
-    def _legacy(self, y: np.ndarray, sigma: float) -> np.ndarray:
-        """Simple Gaussian: y_noisy = y + σ * N(0,1)"""
-        noise = self.rng.normal(0, sigma, size=len(y))
-        return y + noise
-    
-    def _quantile(self, y: np.ndarray, sigma: float,
-                  high_quantile: float = 0.9,
-                  low_quantile: float = 0.1,
-                  high_sigma_mult: float = 2.0,
-                  low_sigma_mult: float = 2.0,
-                  mid_sigma_mult: float = 0.1) -> np.ndarray:
-        """
-        More noise at distribution extremes.
-        
-        Args:
-            high_quantile: Upper quantile threshold (default 0.9)
-            low_quantile: Lower quantile threshold (default 0.1)
-            high_sigma_mult: Multiplier for high values (default 2.0)
-            low_sigma_mult: Multiplier for low values (default 2.0)
-            mid_sigma_mult: Multiplier for middle values (default 0.1)
-        """
-        high_thresh = np.quantile(y, high_quantile)
-        low_thresh = np.quantile(y, low_quantile)
-        
+    # ------------------------------------------------------------------
+    # PER-MOLECULE NOISE SCALE
+    # ------------------------------------------------------------------
+    # Every strategy below works the same way: it computes a per-molecule
+    # noise scale sigma_i from the label, then draws noise ~ N(0, 1) and
+    # multiplies. The `_scale_*` methods return sigma_i WITHOUT touching the
+    # random number generator, so the scale can be computed for molecules that
+    # are never actually corrupted (e.g. a held-out test set) in order to ask
+    # "how noisy is this molecule's region of the label distribution?".
+    #
+    # `reference` is the array whose distribution defines the cut-points
+    # (quantiles for `quantile`, mean/sd for `outlier`). It defaults to `y`
+    # itself, which reproduces the original behaviour exactly. To score
+    # held-out molecules against the noise pattern the TRAINING labels were
+    # exposed to, pass reference=y_train.
+    #
+    # NOTE ON REPRODUCIBILITY: `_legacy` previously drew
+    # rng.normal(0, sigma, n); it now draws rng.normal(0, 1, n) * sigma_i.
+    # These are bit-identical for numpy RandomState (verified), so results
+    # generated before and after this refactor match exactly.
+
+    def _scale_legacy(self, y, sigma):
+        return np.full(len(y), float(sigma))
+
+    def _scale_quantile(self, y, sigma, reference=None,
+                        high_quantile: float = 0.9,
+                        low_quantile: float = 0.1,
+                        high_sigma_mult: float = 2.0,
+                        low_sigma_mult: float = 2.0,
+                        mid_sigma_mult: float = 0.1):
+        ref = y if reference is None else np.asarray(reference).flatten()
+        high_thresh = np.quantile(ref, high_quantile)
+        low_thresh = np.quantile(ref, low_quantile)
         sigma_values = np.full(len(y), sigma * mid_sigma_mult)
         sigma_values[y >= high_thresh] = sigma * high_sigma_mult
         sigma_values[y <= low_thresh] = sigma * low_sigma_mult
-        
-        noise = self.rng.normal(0, 1, size=len(y)) * sigma_values
-        return y + noise
-    
-    def _threshold(self, y: np.ndarray, sigma: float,
-                   high_threshold: float = 1.0,
-                   low_threshold: float = -1.0,
-                   high_sigma_mult: float = 2.0,
-                   low_sigma_mult: float = 2.0,
-                   mid_sigma_mult: float = 0.1) -> np.ndarray:
-        """
-        More noise above/below absolute thresholds.
-        
-        Args:
-            high_threshold: Upper absolute threshold (default 1.0)
-            low_threshold: Lower absolute threshold (default -1.0)
-            high_sigma_mult: Multiplier above high threshold (default 2.0)
-            low_sigma_mult: Multiplier below low threshold (default 2.0)
-            mid_sigma_mult: Multiplier in middle range (default 0.1)
-        """
+        return sigma_values
+
+    def _scale_threshold(self, y, sigma, reference=None,
+                         high_threshold: float = 1.0,
+                         low_threshold: float = -1.0,
+                         high_sigma_mult: float = 2.0,
+                         low_sigma_mult: float = 2.0,
+                         mid_sigma_mult: float = 0.1):
+        # Absolute cut-points: independent of the reference distribution.
         sigma_values = np.full(len(y), sigma * mid_sigma_mult)
         sigma_values[y >= high_threshold] = sigma * high_sigma_mult
         sigma_values[y <= low_threshold] = sigma * low_sigma_mult
-        
-        noise = self.rng.normal(0, 1, size=len(y)) * sigma_values
-        return y + noise
-    
-    def _outlier(self, y: np.ndarray, sigma: float,
-                 outlier_z_threshold: float = 2.0,
-                 outlier_sigma_mult: float = 3.0,
-                 normal_sigma_mult: float = 0.1) -> np.ndarray:
-        """
-        More noise for z-score outliers.
-        
-        Args:
-            outlier_z_threshold: Z-score threshold for outliers (default 2.0)
-            outlier_sigma_mult: Multiplier for outliers (default 3.0)
-            normal_sigma_mult: Multiplier for normal points (default 0.1)
-        """
-        z_scores = np.abs((y - np.mean(y)) / np.std(y))
-        
+        return sigma_values
+
+    def _scale_outlier(self, y, sigma, reference=None,
+                       outlier_z_threshold: float = 2.0,
+                       outlier_sigma_mult: float = 3.0,
+                       normal_sigma_mult: float = 0.1):
+        ref = y if reference is None else np.asarray(reference).flatten()
+        z_scores = np.abs((y - np.mean(ref)) / np.std(ref))
         sigma_values = np.full(len(y), sigma * normal_sigma_mult)
         sigma_values[z_scores > outlier_z_threshold] = sigma * outlier_sigma_mult
-        
-        noise = self.rng.normal(0, 1, size=len(y)) * sigma_values
-        return y + noise
-    
-    def _hetero(self, y: np.ndarray, sigma: float,
-                alpha_mult: float = 0.1,
-                beta_mult: float = 0.05) -> np.ndarray:
-        """
-        Heteroscedastic noise: σ_i = sqrt(alpha*σ² + beta*σ²*|y_i|)
-        
-        Args:
-            alpha_mult: Base variance multiplier (default 0.1)
-            beta_mult: Value-dependent variance multiplier (default 0.05)
-        """
+        return sigma_values
+
+    def _scale_hetero(self, y, sigma, reference=None,
+                      alpha_mult: float = 0.1,
+                      beta_mult: float = 0.05):
         alpha = sigma * sigma * alpha_mult
         beta = sigma * sigma * beta_mult
-        
-        sigma_values = np.sqrt(alpha + beta * np.abs(y))
-        noise = self.rng.normal(0, 1, size=len(y)) * sigma_values
-        return y + noise
-    
-    def _valprop(self, y: np.ndarray, sigma: float,
-                 proportionality_factor: float = 0.05) -> np.ndarray:
-        """
-        Value-proportional: σ_i = base_sigma * (1 + prop_factor * |y_i|)
+        return np.sqrt(alpha + beta * np.abs(y))
 
-        Noise variance scales multiplicatively with the absolute target value,
-        so larger targets receive proportionally more noise.
+    def _scale_valprop(self, y, sigma, reference=None,
+                       proportionality_factor: float = 0.05):
+        return sigma * (1 + proportionality_factor * np.abs(y))
+
+    def noise_scale(self, y: np.ndarray, sigma: float,
+                    reference: Optional[np.ndarray] = None,
+                    **strategy_params) -> np.ndarray:
+        """Per-molecule noise scale sigma_i, with NO noise drawn.
+
+        Pure function of the labels. Does not advance the random number
+        generator, so it is safe to call at any point without changing what
+        `inject` would produce.
 
         Args:
-            proportionality_factor: Proportionality to absolute value (default 0.05)
+            y: labels to compute a scale for.
+            reference: distribution defining the cut-points (see note above).
+                Ignored by strategies whose scale is a pointwise function of y.
+            **strategy_params: same overrides accepted by `inject`.
+
+        Returns:
+            Array of per-molecule noise standard deviations, same length as y.
         """
-        sigma_values = sigma * (1 + proportionality_factor * np.abs(y))
-        noise = self.rng.normal(0, 1, size=len(y)) * sigma_values
-        return y + noise
-    
+        y = np.asarray(y).flatten()
+        if self.strategy == 'legacy':
+            return self._scale_legacy(y, sigma)
+        if self.strategy == 'quantile':
+            return self._scale_quantile(y, sigma, reference, **strategy_params)
+        if self.strategy == 'threshold':
+            return self._scale_threshold(y, sigma, reference, **strategy_params)
+        if self.strategy == 'outlier':
+            return self._scale_outlier(y, sigma, reference, **strategy_params)
+        if self.strategy == 'hetero':
+            return self._scale_hetero(y, sigma, reference, **strategy_params)
+        if self.strategy == 'valprop':
+            return self._scale_valprop(y, sigma, reference, **strategy_params)
+        raise ValueError(f"Unknown strategy: {self.strategy}")
+
+    def inject_verbose(self, y: np.ndarray, sigma: float,
+                       reference: Optional[np.ndarray] = None,
+                       **strategy_params):
+        """`inject`, but it also hands back what it did.
+
+        Returns:
+            y_noisy: the corrupted labels (identical to `inject` for the same
+                RNG state).
+            sigma_i: the per-molecule noise scale actually applied.
+            epsilon: the noise actually added to each molecule.
+
+        This is the entry point for any analysis that asks whether a model's
+        predicted uncertainty tracks the corruption, because it is the only
+        way to know per molecule how much corruption there was.
+        """
+        y = np.asarray(y).flatten()
+        sigma_i = self.noise_scale(y, sigma, reference, **strategy_params)
+        epsilon = self.rng.normal(0, 1, size=len(y)) * sigma_i
+        return y + epsilon, sigma_i, epsilon
+
+    def _legacy(self, y: np.ndarray, sigma: float) -> np.ndarray:
+        """Simple Gaussian: y_noisy = y + sigma * N(0,1)"""
+        return y + self.rng.normal(0, 1, size=len(y)) * self._scale_legacy(y, sigma)
+
+    def _quantile(self, y: np.ndarray, sigma: float, **p) -> np.ndarray:
+        """More noise at distribution extremes."""
+        return y + self.rng.normal(0, 1, size=len(y)) * self._scale_quantile(y, sigma, None, **p)
+
+    def _threshold(self, y: np.ndarray, sigma: float, **p) -> np.ndarray:
+        """More noise above/below absolute thresholds."""
+        return y + self.rng.normal(0, 1, size=len(y)) * self._scale_threshold(y, sigma, None, **p)
+
+    def _outlier(self, y: np.ndarray, sigma: float, **p) -> np.ndarray:
+        """More noise for z-score outliers."""
+        return y + self.rng.normal(0, 1, size=len(y)) * self._scale_outlier(y, sigma, None, **p)
+
+    def _hetero(self, y: np.ndarray, sigma: float, **p) -> np.ndarray:
+        """Heteroscedastic noise: sigma_i = sqrt(alpha*s^2 + beta*s^2*|y_i|)"""
+        return y + self.rng.normal(0, 1, size=len(y)) * self._scale_hetero(y, sigma, None, **p)
+
+    def _valprop(self, y: np.ndarray, sigma: float, **p) -> np.ndarray:
+        """Value-proportional: sigma_i = sigma * (1 + f * |y_i|)"""
+        return y + self.rng.normal(0, 1, size=len(y)) * self._scale_valprop(y, sigma, None, **p)
+
     def get_effective_noise(self, y_clean: np.ndarray, y_noisy: np.ndarray, 
                            method: str = 'std_normalized') -> float:
         """
