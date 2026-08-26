@@ -13,6 +13,7 @@ from noiseInject import (
     NoiseInjectorRegression,
     NoiseInjectorClassification,
     CONDITIONS,
+    dose_tolerance,
     calibrate_flip_probability,
     calculate_noise_metrics,
     calculate_classification_metrics,
@@ -30,6 +31,8 @@ from noiseInject import (
 
 DOSE_MATCHED = [c for c, spec in CONDITIONS.items() if spec['strategy'] != 'censoring']
 CENSORING = [c for c, spec in CONDITIONS.items() if spec['strategy'] == 'censoring']
+# For censoring the LEVEL is the fraction clipped, not a dose.
+CENSORING_LEVEL = 0.25
 
 
 def _labels(n=20000, seed=0):
@@ -69,10 +72,10 @@ def test_invalid_strategy_raises():
 def test_dose_is_flat_across_conditions(condition):
     """THE check. Every condition delivers the requested amount, not its own.
 
-    Tolerance follows NOISE_DESIGN.md section 5.1b: 0.5%, relaxed to 3% for
-    Student-t at nu = 3 where the fourth moment is infinite and the sample
-    statistic is unstable by construction, and for grouped-shifted whose group
-    term has few degrees of freedom (section 2a rule 3).
+    The tolerance is DERIVED per condition from its fourth moment and its
+    effective number of independent contributions (`dose_tolerance`), not
+    hand-kept. A list of "unstable conditions" would need editing every time a
+    condition is added, and would silently stop covering the new one.
     """
     y, g = _labels(), _groups()
     tau = 0.5 * y.std()
@@ -82,17 +85,20 @@ def test_dose_is_flat_across_conditions(condition):
     # 1. The solved scale hits the target EXACTLY -- this part is arithmetic,
     #    and it is the half of the gate that does not depend on a draw.
     for r in runs:
-        assert r.unit_dose * r.solved_scale == pytest.approx(tau, rel=1e-12)
+        assert r.unit_dose_g * r.solved_scale == pytest.approx(tau, rel=1e-12)
 
     # 2. The MEAN realised dose hits it. A single realisation cannot: at
     #    n = 20,000 the sampling spread of an RMS estimate is already 0.5%, and
     #    for grouped-shifted the group term has only a few hundred degrees of
     #    freedom. Section 2a rule 3 -- fix the population dose, record the
     #    realised one.
-    mean_dose = float(np.mean([r.delivered_dose for r in runs]))
-    tol = 0.03 if condition in ('student_t_nu3', 'grouped_shifted') else 0.005
-    assert mean_dose == pytest.approx(tau, rel=tol), (
-        f"{condition}: asked for {tau:.4f}, delivered {mean_dose:.4f} on average")
+    mean_dose = float(np.mean([r.realised_dose_label_units for r in runs]))
+    r0 = runs[0]
+    tol = dose_tolerance(r0.epsilon, r0.effective_n,
+                         nu=CONDITIONS[condition].get('nu')) / np.sqrt(len(runs))
+    assert mean_dose == pytest.approx(tau, rel=max(tol, 0.002)), (
+        f"{condition}: asked for {tau:.4f}, delivered {mean_dose:.4f} on average"
+        f" (tolerance {100 * tol:.2f}%, effective n {r0.effective_n:.0f})")
 
 
 def test_zero_dose_records_exactly_zero():
@@ -116,8 +122,9 @@ def test_zero_dose_records_exactly_zero():
 def test_recorded_noise_reconstructs_the_label_exactly(condition):
     """y_clean + epsilon == y_noisy, bit for bit. Recorded, never reconstructed."""
     y, g = _labels(5000), _groups(5000)
+    level = CENSORING_LEVEL if condition in CENSORING else 0.4
     r = NoiseInjectorRegression.from_condition(condition, random_state=3).inject_verbose(
-        y, 0.4, groups=g)
+        y, level, groups=g)
     assert np.array_equal(r.y_clean + r.epsilon, r.y_noisy)
 
 
@@ -129,7 +136,7 @@ def test_student_t_reduces_to_gaussian_in_the_limit():
                                     nu=200.0, random_state=11).inject_verbose(y, tau)
     normal = NoiseInjectorRegression.from_condition('gaussian',
                                                     random_state=11).inject_verbose(y, tau)
-    assert heavy.unit_dose == pytest.approx(normal.unit_dose, abs=0.006)
+    assert heavy.unit_dose_g == pytest.approx(normal.unit_dose_g, abs=0.006)
     frac = lambda r: np.mean(np.abs(r.epsilon) > 3 * tau)
     assert frac(heavy) == pytest.approx(frac(normal), abs=0.002)
 
@@ -228,35 +235,36 @@ def test_only_censoring_and_grouped_shifted_move_labels_off_centre():
     tau = 0.5 * y.std()
     zero_mean = [c for c in DOSE_MATCHED if c != 'grouped_shifted']
     scatter = [abs(NoiseInjectorRegression.from_condition(c, random_state=4).inject_verbose(
-        y, tau, groups=g).mean_shift) for c in zero_mean]
+        y, tau, groups=g).mean_epsilon) for c in zero_mean]
     shifted = NoiseInjectorRegression.from_condition(
         'grouped_shifted', random_state=4).inject_verbose(y, tau, groups=g)
-    cens = NoiseInjectorRegression.from_condition('censoring_25', random_state=4).inject_verbose(
-        y, tau, groups=g)
+    cens = NoiseInjectorRegression.from_condition('censoring', random_state=4).inject_verbose(
+        y, 0.25, groups=g)
 
     assert max(scatter) < 0.02 * tau                 # the five scatter conditions stay centred
-    assert abs(shifted.mean_shift) > 5 * max(scatter)
-    assert abs(cens.mean_shift) > 10 * max(scatter)
-    assert cens.mean_shift < 0                       # an upper limit lowers labels
+    assert abs(shifted.mean_epsilon) > 5 * max(scatter)
+    assert abs(cens.mean_epsilon) > 10 * max(scatter)
+    assert cens.mean_epsilon < 0                       # an upper limit lowers labels
 
 
 def test_censoring_clips_the_requested_fraction_and_nothing_else():
     y = _labels()
-    r = NoiseInjectorRegression.from_condition('censoring_30', random_state=0).inject_verbose(y, 0.0)
+    r = NoiseInjectorRegression.from_condition('censoring', random_state=0).inject_verbose(y, 0.30)
     assert r.affected_molecule_fraction == pytest.approx(0.30, abs=0.005)
+    assert r.as_row()['noise_type'] == 'censoring_30'      # the name is derived
     assert np.all(r.y_noisy <= r.censoring_limit + 1e-9)
     untouched = r.epsilon == 0
     assert np.all(r.y_noisy[untouched] == y[untouched])
-    assert np.isnan(r.unit_dose) and np.isnan(r.target_dose)   # not dose-matched
+    assert np.isnan(r.unit_dose_g) and np.isnan(r.target_dose_label_units)   # not dose-matched
 
 
 def test_censoring_scores_held_out_molecules_against_the_training_limit():
     """The cut-point comes from the TRAINING labels, or held-out molecules are
     scored against a distribution they were never exposed to."""
     y_train, y_test = _labels(8000, seed=0), _labels(4000, seed=99) + 2.0
-    inj = NoiseInjectorRegression.from_condition('censoring_20', random_state=0)
-    scale_own = inj.noise_scale(y_test, 0.0)
-    scale_ref = inj.noise_scale(y_test, 0.0, reference=y_train)
+    inj = NoiseInjectorRegression.from_condition('censoring', random_state=0)
+    scale_own = inj.noise_scale(y_test, 0.20)
+    scale_ref = inj.noise_scale(y_test, 0.20, reference=y_train)
     assert not np.allclose(scale_own, scale_ref)
     assert (scale_ref > 0).mean() > (scale_own > 0).mean()
 
@@ -267,13 +275,16 @@ def test_every_provenance_field_is_populated():
     """A blank provenance column is how the dose confound survived for years."""
     y, g = _labels(4000), _groups(4000)
     for condition in DOSE_MATCHED + CENSORING:
+        level = CENSORING_LEVEL if condition in CENSORING else 0.4
         row = NoiseInjectorRegression.from_condition(condition, random_state=8).inject_verbose(
-            y, 0.4, groups=g).as_row()
-        for key in ('condition', 'strategy', 'distribution', 'delivered_dose',
-                    'delivered_dose_fraction_of_sd', 'affected_molecule_fraction',
-                    'mean_shift', 'n_groups', 'largest_group_share', 'seed'):
+            y, level, groups=g).as_row()
+        for key in ('noise_type', 'shape_name', 'targeting_name',
+                    'realised_dose_label_units', 'realised_dose_fraction_of_spread',
+                    'affected_molecule_fraction', 'mean_epsilon', 'effective_n',
+                    'n_groups', 'largest_group_share', 'clean_label_sd', 'seed'):
             assert row[key] is not None, f"{condition}: {key} is blank"
-        assert row['condition'] == condition
+        expected = 'censoring_25' if condition in CENSORING else condition
+        assert row['noise_type'] == expected
 
 
 def test_shape_only_conditions_declare_their_scale_degenerate():

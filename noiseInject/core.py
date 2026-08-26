@@ -64,12 +64,12 @@ CONDITIONS: Dict[str, Dict[str, Any]] = {
     'outlier_p01':     dict(strategy='outlier',         distribution='gaussian', p=0.01, lam=3.0),
     'outlier_p05':     dict(strategy='outlier',         distribution='gaussian', p=0.05, lam=3.0),
     'outlier_p10':     dict(strategy='outlier',         distribution='gaussian', p=0.10, lam=3.0),
-    'censoring_10':    dict(strategy='censoring',       distribution='gaussian', censored_fraction=0.10),
-    'censoring_20':    dict(strategy='censoring',       distribution='gaussian', censored_fraction=0.20),
-    'censoring_25':    dict(strategy='censoring',       distribution='gaussian', censored_fraction=0.25),
-    'censoring_30':    dict(strategy='censoring',       distribution='gaussian', censored_fraction=0.30),
-    'censoring_40':    dict(strategy='censoring',       distribution='gaussian', censored_fraction=0.40),
-    'censoring_50':    dict(strategy='censoring',       distribution='gaussian', censored_fraction=0.50),
+    # Censoring is swept on its own axis, so the LEVEL is the fraction of labels
+    # clipped rather than a dose. One entry, not one per fraction: baking the
+    # fraction into the name as well would put the same number in two places, and
+    # a "level 0" run would then still clip -- so the clean baseline would not be
+    # clean. The reported name is derived from the level, as `censoring_25`.
+    'censoring':       dict(strategy='censoring',       distribution='gaussian', side='upper'),
 }
 
 REGRESSION_STRATEGIES = ('uniform', 'grouped_wider', 'grouped_shifted', 'outlier', 'censoring')
@@ -81,6 +81,34 @@ REGRESSION_DISTRIBUTIONS = ('gaussian', 'student_t', 'laplace')
 _CONSTANT_SCALE_STRATEGIES = ('uniform',)
 
 
+def dose_tolerance(epsilon, effective_n, nu=None):
+    """How close the realised dose can be expected to land, for THIS condition.
+
+    Derived, not hand-kept. The sampling spread of a root-mean-square estimate
+    depends on the fourth moment and on how many independent contributions it is
+    averaged over, so a heavy-tailed shape and a group-level term are both
+    imprecise for the same structural reason -- not because they are defective.
+    Keeping a list of "unstable conditions" instead would need editing every time
+    a condition is added, and would silently stop covering the new one.
+
+    Three standard errors, floored at the half a percent the design quotes for
+    the full QM9 label column. Student-t at nu <= 4 gets a flat 15%: its fourth
+    moment is infinite, so the sample kurtosis this is computed from is itself
+    meaningless.
+
+    Matches `dose_tolerance` in `rust/src/main.rs`.
+    """
+    if nu is not None and float(nu) <= 4.0:
+        return 0.15
+    epsilon = np.asarray(epsilon, dtype=float)
+    n_eff = max(float(effective_n), 1.0)
+    m2 = float(np.mean(epsilon ** 2))
+    m4 = float(np.mean(epsilon ** 4))
+    kurtosis = min(max(m4 / (m2 * m2), 3.0), 60.0) if m2 > 0 else 3.0
+    se = math.sqrt((kurtosis - 1.0) / (4.0 * n_eff))
+    return max(3.0 * se, 0.005)
+
+
 class InjectionResult:
     """Everything one injection produced, including its provenance.
 
@@ -90,12 +118,16 @@ class InjectionResult:
     (`RERUN_PLAN.md` section 5.2).
     """
 
+    # The field names match `NoisePlan` in `rust/src/main.rs` exactly. Two names
+    # for one quantity is how the same values ended up captioned with two
+    # different metrics on facing pages of the paper.
     __slots__ = ('y_clean', 'y_noisy', 'epsilon', 'noise_scale', 'condition',
-                 'strategy', 'distribution', 'params', 'target_dose',
-                 'unit_dose', 'solved_scale', 'delivered_dose',
-                 'delivered_dose_fraction_of_sd', 'affected_molecule_fraction',
-                 'mean_shift', 'n_groups', 'largest_group_share', 'seed',
-                 'scale_is_degenerate', 'censoring_limit')
+                 'strategy', 'distribution', 'params', 'target_dose_label_units',
+                 'unit_dose_g', 'solved_scale', 'realised_dose_label_units',
+                 'realised_dose_fraction_of_spread', 'affected_molecule_fraction',
+                 'mean_epsilon', 'effective_n', 'n_groups', 'largest_group_share',
+                 'seed', 'scale_is_degenerate', 'censoring_limit',
+                 'clean_label_mean', 'clean_label_sd')
 
     def __init__(self, **kwargs):
         for name in self.__slots__:
@@ -104,19 +136,22 @@ class InjectionResult:
     def as_row(self) -> Dict[str, Any]:
         """The provenance fields, for writing beside every result."""
         return {
-            'condition': self.condition,
-            'strategy': self.strategy,
-            'distribution': self.distribution,
-            'target_dose': self.target_dose,
-            'unit_dose': self.unit_dose,
+            'noise_type': self.condition,
+            'shape_name': self.distribution,
+            'targeting_name': self.strategy,
+            'unit_dose_g': self.unit_dose_g,
             'solved_scale': self.solved_scale,
-            'delivered_dose': self.delivered_dose,
-            'delivered_dose_fraction_of_sd': self.delivered_dose_fraction_of_sd,
+            'target_dose_label_units': self.target_dose_label_units,
+            'realised_dose_label_units': self.realised_dose_label_units,
+            'realised_dose_fraction_of_spread': self.realised_dose_fraction_of_spread,
+            'mean_epsilon': self.mean_epsilon,
             'affected_molecule_fraction': self.affected_molecule_fraction,
-            'mean_shift': self.mean_shift,
+            'effective_n': self.effective_n,
+            'censoring_limit': self.censoring_limit,
             'n_groups': self.n_groups,
             'largest_group_share': self.largest_group_share,
-            'censoring_limit': self.censoring_limit,
+            'clean_label_mean': self.clean_label_mean,
+            'clean_label_sd': self.clean_label_sd,
             'seed': self.seed,
             'scale_is_degenerate': self.scale_is_degenerate,
         }
@@ -126,9 +161,9 @@ class InjectionResult:
         return iter((self.y_noisy, self.noise_scale, self.epsilon))
 
     def __repr__(self):
-        return (f"InjectionResult(condition={self.condition!r}, "
-                f"target_dose={self.target_dose:.4g}, "
-                f"delivered_dose={self.delivered_dose:.4g}, "
+        return (f"InjectionResult(noise_type={self.condition!r}, "
+                f"target={self.target_dose_label_units:.4g}, "
+                f"realised={self.realised_dose_label_units:.4g}, "
                 f"affected={self.affected_molecule_fraction:.4g})")
 
 
@@ -225,6 +260,17 @@ class NoiseInjectorRegression:
     def condition(self, value):
         self._condition = value
 
+    @property
+    def scale_is_degenerate(self) -> bool:
+        """True when every molecule gets the same noise scale.
+
+        For the three shape-only conditions the per-molecule scale is constant,
+        so "which molecules are unreliable" is UNDEFINED there -- not zero. A
+        rank correlation against a constant must never be reported. This is a
+        property of the condition, not a defect.
+        """
+        return self.strategy in _CONSTANT_SCALE_STRATEGIES
+
     # ------------------------------------------------------------------
     # SHAPE
     # ------------------------------------------------------------------
@@ -262,24 +308,48 @@ class NoiseInjectorRegression:
     # ------------------------------------------------------------------
     # TARGETING -- the per-molecule scale map
     # ------------------------------------------------------------------
+    def _selection_rng(self) -> np.random.RandomState:
+        """A generator for WHO gets hit, separate from the shape draws.
+
+        It is re-seeded from `random_state` on every call, so the scale map is a
+        deterministic function of (seed, groups, parameters) and does not depend
+        on how many shape draws have happened. That is what the confound control
+        needs: the *pattern* of unreliability must be the same column at every
+        noise level, including zero, or the zero-noise subtraction is comparing
+        two different patterns rather than isolating the effect of the noise.
+        """
+        seed = self.random_state
+        if seed is None:
+            return np.random.RandomState()
+        return np.random.RandomState((int(seed) ^ 0x5CA1E) & 0xFFFFFFFF)
+
     def scale_map(self, y: np.ndarray, groups: Optional[np.ndarray] = None,
                   **params) -> Tuple[np.ndarray, float]:
         """Per-molecule multipliers at unit scale, and the affected fraction.
 
-        Draws from the generator for the two selection rules (which groups,
-        which records), and is pure for the rest.
+        Deterministic given (seed, groups, parameters): the two selection rules
+        draw from a separately seeded generator, so calling this twice on one
+        injector returns the same map both times.
         """
         y = np.asarray(y).flatten()
         n = len(y)
+        sel = self._selection_rng()
 
         if self.strategy == 'uniform':
-            return np.ones(n), 0.0
+            # 1.0, not 0.0: every molecule IS affected. The alternative reading,
+            # "no targeting applies", is defensible for the name but cannot
+            # share the column with the selection rules' fractions, and it left
+            # this implementation disagreeing with itself -- grouped-shifted,
+            # which also perturbs everything, already recorded 1.0. Settled
+            # 2026-08-26 across all three implementations; see NOISE_DESIGN.md
+            # section 5.1c.
+            return np.ones(n), 1.0
 
         if self.strategy == 'grouped_wider':
             lam = float(self._param('lam', params))
             f = float(self._param('group_fraction', params))
             groups = self._require_groups(groups, n)
-            affected = self._select_groups_by_molecule_fraction(groups, f)
+            affected = self._select_groups_by_molecule_fraction(groups, f, sel)
             scales = np.where(affected, lam, 1.0)
             return scales, float(affected.mean())
 
@@ -291,7 +361,7 @@ class NoiseInjectorRegression:
         if self.strategy == 'outlier':
             lam = float(self._param('lam', params))
             p = float(self._param('p', params))
-            hit = self.rng.random_sample(n) < p
+            hit = sel.random_sample(n) < p
             scales = np.where(hit, lam, 1.0)
             return scales, float(hit.mean())
 
@@ -312,7 +382,8 @@ class NoiseInjectorRegression:
             raise ValueError(f"groups has length {len(groups)}, labels have {n}")
         return groups
 
-    def _select_groups_by_molecule_fraction(self, groups: np.ndarray, f: float) -> np.ndarray:
+    def _select_groups_by_molecule_fraction(self, groups: np.ndarray, f: float,
+                                            sel: np.random.RandomState) -> np.ndarray:
         """Choose whole groups until the affected MOLECULE fraction is closest to f.
 
         Selecting a fraction of *groups* is what the first draft did, and it does
@@ -325,7 +396,7 @@ class NoiseInjectorRegression:
         uniq, inverse = np.unique(groups, return_inverse=True)
         sizes = np.bincount(inverse, minlength=len(uniq))
         n = len(groups)
-        order = self.rng.permutation(len(uniq))
+        order = sel.permutation(len(uniq))
 
         chosen = []
         cum = 0
@@ -386,7 +457,9 @@ class NoiseInjectorRegression:
         n_groups, largest_share = self._group_summary(groups)
 
         if self.strategy == 'censoring':
-            return self._inject_censoring(y, ref, n_groups, largest_share, **params)
+            # The level IS the censored fraction here, not a dose.
+            return self._inject_censoring(y, ref, n_groups, largest_share,
+                                          censored_fraction=dose, **params)
 
         # Zero dose is exactly zero. Not a small number -- the negative control
         # the old reconstruction never had.
@@ -411,7 +484,7 @@ class NoiseInjectorRegression:
         return self._result(y, epsilon, noise_scale, dose, unit_dose=g,
                             solved_scale=solved, affected=affected,
                             n_groups=n_groups, largest_share=largest_share,
-                            params=params)
+                            params=params, scales=scales, groups=groups)
 
     def _draw_grouped_shifted(self, y, dose, groups, **params):
         """Group-level offset plus a within-molecule error.
@@ -449,6 +522,10 @@ class NoiseInjectorRegression:
         side = str(self._param('side', params, default='upper'))
         if not 0.0 <= frac < 1.0:
             raise ValueError(f"censored_fraction must lie in [0, 1), got {frac}")
+        # The reported name carries the fraction, derived from the level rather
+        # than stored beside it. Matches `condition_name` in rust/src/main.rs.
+        pct = int(round(frac * 100))
+        self._condition = f"censoring_{pct}" if side == 'upper' else f"censoring_lower_{pct}"
 
         if frac == 0.0:
             zeros = np.zeros(len(y))
@@ -479,24 +556,56 @@ class NoiseInjectorRegression:
 
     def _result(self, y, epsilon, noise_scale, target_dose, unit_dose,
                 solved_scale, affected, n_groups, largest_share, params,
-                censoring_limit=None):
+                censoring_limit=None, effective_n=None, scales=None, groups=None):
         y_noisy = y + epsilon
         sd = float(np.std(y))
-        delivered = float(np.sqrt(np.mean(epsilon ** 2)))
+        realised = float(np.sqrt(np.mean(epsilon ** 2)))
+        if effective_n is None:
+            effective_n = self._effective_n(len(y), scales, params, n_groups,
+                                            groups=groups)
         return InjectionResult(
             y_clean=y, y_noisy=y_noisy, epsilon=epsilon, noise_scale=noise_scale,
             condition=self.condition, strategy=self.strategy,
             distribution=self.distribution,
             params={**self.params, **params},
-            target_dose=target_dose, unit_dose=unit_dose, solved_scale=solved_scale,
-            delivered_dose=delivered,
-            delivered_dose_fraction_of_sd=(delivered / sd if sd > 1e-12 else float('nan')),
+            target_dose_label_units=target_dose, unit_dose_g=unit_dose,
+            solved_scale=solved_scale,
+            realised_dose_label_units=realised,
+            realised_dose_fraction_of_spread=(realised / sd if sd > 1e-12 else float('nan')),
             affected_molecule_fraction=affected,
-            mean_shift=float(np.mean(epsilon)),
+            mean_epsilon=float(np.mean(epsilon)),
+            effective_n=effective_n,
             n_groups=n_groups, largest_group_share=largest_share,
+            clean_label_mean=float(np.mean(y)), clean_label_sd=sd,
             seed=self.random_state, censoring_limit=censoring_limit,
-            scale_is_degenerate=(self.strategy in _CONSTANT_SCALE_STRATEGIES),
+            scale_is_degenerate=self.scale_is_degenerate,
         )
+
+    def _effective_n(self, n, scales, params, n_groups=None, groups=None):
+        """How many independent contributions the delivered dose is averaged over.
+
+        NOT the molecule count. A scale map that concentrates the noise on a few
+        molecules, or a group-level term drawn once per scaffold group, pins the
+        realised dose far less precisely than the raw count suggests. This is
+        what makes the dose tolerance derivable instead of a hand-kept list of
+        "unstable" conditions. Matches `effective_n` in `rust/src/main.rs`.
+        """
+        if self.strategy == 'grouped_shifted':
+            rho = float(self._param('rho', params, default=0.62))
+            # NOT the group count. The group term is averaged over molecules, so
+            # a few large groups dominate: the effective number of independent
+            # group contributions is (sum n_g)^2 / sum n_g^2, which on real QM9
+            # scaffolds is 189 against a group COUNT of 30,313 -- a factor of
+            # 160. Using the count overstates the precision of the delivered
+            # dose by the same factor and makes the flat-dose gate fail on
+            # sampling variability that was never a defect.
+            g = self._effective_group_count(groups, n)
+            return 1.0 / (rho * rho / g + (1.0 - rho) ** 2 / n)
+        if scales is None:
+            return float(n)
+        s2 = float(np.sum(scales ** 2))
+        s4 = float(np.sum(scales ** 4))
+        return (s2 * s2 / s4) if s4 > 0 else float(n)
 
     @staticmethod
     def _group_summary(groups):
@@ -505,6 +614,17 @@ class NoiseInjectorRegression:
         groups = np.asarray(groups).flatten()
         _, counts = np.unique(groups, return_counts=True)
         return int(len(counts)), float(counts.max() / len(groups))
+
+    @staticmethod
+    def _effective_group_count(groups, n):
+        """(sum n_g)^2 / sum n_g^2 -- how many groups the molecule-weighted
+        average behaves like, which is far fewer than the group count when the
+        sizes are uneven. Real Murcko scaffolds are very uneven."""
+        if groups is None:
+            return 1.0
+        counts = np.bincount(np.asarray(groups).flatten().astype(np.int64))
+        counts = counts[counts > 0].astype(float)
+        return float(counts.sum() ** 2 / np.sum(counts ** 2))
 
     def inject(self, y: np.ndarray, dose: float, groups: Optional[np.ndarray] = None,
                reference: Optional[np.ndarray] = None, **params) -> np.ndarray:
@@ -536,7 +656,8 @@ class NoiseInjectorRegression:
 
         if self.strategy == 'censoring':
             ref = y if reference is None else np.asarray(reference, dtype=float).flatten()
-            frac = float(self._param('censored_fraction', params))
+            # The level is the censored fraction, as in inject_verbose.
+            frac = float(params.pop('censored_fraction', dose))
             side = str(self._param('side', params, default='upper'))
             if frac == 0.0:
                 return np.zeros(len(y))
