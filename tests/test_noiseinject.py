@@ -201,6 +201,51 @@ def test_grouped_wider_records_the_realised_molecule_fraction():
     assert scales[1] / scales[0] == pytest.approx(3.0, rel=1e-6)
 
 
+def test_held_out_molecules_are_scored_against_the_TRAINING_selection():
+    """The pattern a held-out molecule is scored against must describe the
+    injection that actually happened.
+
+    `noise_scale` re-runs the group selection on whatever group array it is
+    given. Without `reference_groups` that means the held-out molecules' own
+    groups, which picks a DIFFERENT set: on a 40-group split, two of the eight
+    groups corrupted in training went unmarked. Question B -- does the model
+    learn where the data is unreliable -- would then be scored against an
+    injection that never happened, and for the grouped conditions that is the
+    whole question.
+    """
+    rng = np.random.RandomState(0)
+    g_train, g_test = rng.randint(0, 40, 800), rng.randint(0, 40, 200)
+    y_train, y_test = _labels(800, seed=0), _labels(200, seed=5)
+
+    inj = NoiseInjectorRegression.from_condition('grouped_wider', random_state=7)
+    injected = inj.inject_verbose(y_train, 0.5, groups=g_train)
+    hit = {int(g) for g in np.unique(g_train[injected.noise_scale >
+                                             injected.noise_scale.min()])}
+    assert len(hit) > 1
+
+    right = inj.noise_scale(y_test, 0.5, reference=y_train, groups=g_test,
+                            reference_groups=g_train)
+    marked = {int(g) for g in np.unique(g_test[right > right.min()])}
+    assert marked == hit & set(g_test.tolist()), (
+        f"scored against {sorted(marked)}, training was corrupted in {sorted(hit)}")
+
+    # And the bug is real: without reference_groups the two sets differ.
+    wrong = inj.noise_scale(y_test, 0.5, reference=y_train, groups=g_test)
+    assert {int(g) for g in np.unique(g_test[wrong > wrong.min()])} != marked
+
+
+def test_grouped_shifted_declares_its_scale_degenerate():
+    """Every group's offset is drawn from the same distribution, so every
+    molecule is equally affected and the per-molecule scale carries no
+    information. What differs by group is the DIRECTION -- the mechanism -- not
+    a magnitude a model could rank. The flag must agree with the array."""
+    y, g = _labels(3000), _groups(3000)
+    inj = NoiseInjectorRegression.from_condition('grouped_shifted', random_state=0)
+    assert inj.scale_is_degenerate
+    assert len(np.unique(inj.noise_scale(y, 0.4, groups=g))) == 1
+    assert inj.inject_verbose(y, 0.4, groups=g).scale_is_degenerate
+
+
 def test_grouped_shifted_moves_whole_groups_together():
     """Every molecule in a group shares one offset -- that is the mechanism.
 

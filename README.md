@@ -149,10 +149,17 @@ See `notebooks/02_uncertainty.ipynb` for a worked example.
 ## Features
 
 ✓ Model-agnostic (works with any sklearn-compatible model)  
-✓ Calibration for fair strategy comparison  
+✓ **Dose-matched by construction** — every regression condition delivers the noise
+  level you asked for, so a comparison between conditions measures shape, not amount  
+✓ **Traceable** — `inject_verbose` returns the noise actually drawn per record and the
+  provenance of the run, so no downstream figure is untraceable to what produced it  
+✓ Calibration for fair comparison of classification flip rates  
 ✓ Per-class robustness analysis (classification)  
-✓ Backward compatible (NoiseInjector alias maintained)  
 ✓ Minimal dependencies (numpy, pandas, scipy, sklearn)
+
+**1.0.0 is a breaking change and is not backward compatible.** The six regression
+strategies (`legacy`, `quantile`, `threshold`, `outlier`, `hetero`, `valprop`) and the
+regression calibrators are gone; see *Strategies* above. Classification is unchanged.
 
 ## Examples
 

@@ -76,9 +76,11 @@ REGRESSION_STRATEGIES = ('uniform', 'grouped_wider', 'grouped_shifted', 'outlier
 REGRESSION_DISTRIBUTIONS = ('gaussian', 'student_t', 'laplace')
 
 # Conditions whose per-molecule noise scale is the same for every molecule.
-# For these the question "which region of the label space is unreliable" is
-# undefined rather than answered with zero -- see `InjectionResult.scale_is_degenerate`.
-_CONSTANT_SCALE_STRATEGIES = ('uniform',)
+# grouped-shifted belongs here: every group's offset is drawn from the same
+# distribution, so every molecule is equally affected in expectation and the
+# scale carries no per-molecule information -- what differs by group is the
+# DIRECTION, which is the mechanism, not a magnitude a model could rank.
+_CONSTANT_SCALE_STRATEGIES = ('uniform', 'grouped_shifted')
 
 
 def dose_tolerance(epsilon, effective_n, nu=None):
@@ -324,12 +326,22 @@ class NoiseInjectorRegression:
         return np.random.RandomState((int(seed) ^ 0x5CA1E) & 0xFFFFFFFF)
 
     def scale_map(self, y: np.ndarray, groups: Optional[np.ndarray] = None,
+                  reference_groups: Optional[np.ndarray] = None,
                   **params) -> Tuple[np.ndarray, float]:
         """Per-molecule multipliers at unit scale, and the affected fraction.
 
         Deterministic given (seed, groups, parameters): the two selection rules
         draw from a separately seeded generator, so calling this twice on one
         injector returns the same map both times.
+
+        `reference_groups` is the assignment the SELECTION is made on, defaulting
+        to `groups`. It matters only when scoring molecules that were not the
+        ones injected: the affected groups must be the ones the TRAINING labels
+        were exposed to, then looked up by group id for whoever is being scored.
+        Re-running the selection over the held-out molecules' own groups picks a
+        different set -- measured on a 40-group split, two of eight corrupted
+        groups went unmarked -- so the "does the model learn where the data is
+        unreliable" question would be scored against the wrong target.
         """
         y = np.asarray(y).flatten()
         n = len(y)
@@ -349,7 +361,12 @@ class NoiseInjectorRegression:
             lam = float(self._param('lam', params))
             f = float(self._param('group_fraction', params))
             groups = self._require_groups(groups, n)
-            affected = self._select_groups_by_molecule_fraction(groups, f, sel)
+            # The selection is made on the reference assignment; membership is
+            # then looked up by group id for the molecules actually passed.
+            ref_g = groups if reference_groups is None else \
+                np.asarray(reference_groups).flatten()
+            chosen = self._select_affected_group_ids(ref_g, f, sel)
+            affected = np.isin(groups, list(chosen))
             scales = np.where(affected, lam, 1.0)
             return scales, float(affected.mean())
 
@@ -382,8 +399,8 @@ class NoiseInjectorRegression:
             raise ValueError(f"groups has length {len(groups)}, labels have {n}")
         return groups
 
-    def _select_groups_by_molecule_fraction(self, groups: np.ndarray, f: float,
-                                            sel: np.random.RandomState) -> np.ndarray:
+    def _select_affected_group_ids(self, groups: np.ndarray, f: float,
+                                   sel: np.random.RandomState) -> set:
         """Choose whole groups until the affected MOLECULE fraction is closest to f.
 
         Selecting a fraction of *groups* is what the first draft did, and it does
@@ -407,9 +424,7 @@ class NoiseInjectorRegression:
             cum += sizes[g]
             if cum / n >= f:
                 break
-        chosen_set = np.zeros(len(uniq), dtype=bool)
-        chosen_set[chosen] = True
-        return chosen_set[inverse]
+        return {uniq[i] for i in chosen}
 
     # ------------------------------------------------------------------
     # THE DOSE SOLVER
@@ -428,6 +443,7 @@ class NoiseInjectorRegression:
     def inject_verbose(self, y: np.ndarray, dose: float,
                        groups: Optional[np.ndarray] = None,
                        reference: Optional[np.ndarray] = None,
+                       reference_groups: Optional[np.ndarray] = None,
                        **params) -> InjectionResult:
         """Inject noise and return it with everything needed to trace it.
 
@@ -470,7 +486,8 @@ class NoiseInjectorRegression:
                                 n_groups=n_groups, largest_share=largest_share,
                                 params=params)
 
-        scales, affected = self.scale_map(y, groups=groups, **params)
+        scales, affected = self.scale_map(y, groups=groups,
+                                         reference_groups=reference_groups, **params)
         g = self.unit_dose(scales, **params)
         solved = dose / g
 
@@ -627,23 +644,32 @@ class NoiseInjectorRegression:
         return float(counts.sum() ** 2 / np.sum(counts ** 2))
 
     def inject(self, y: np.ndarray, dose: float, groups: Optional[np.ndarray] = None,
-               reference: Optional[np.ndarray] = None, **params) -> np.ndarray:
+               reference: Optional[np.ndarray] = None,
+               reference_groups: Optional[np.ndarray] = None, **params) -> np.ndarray:
         """Inject noise, returning the noisy labels only."""
         return self.inject_verbose(y, dose, groups=groups, reference=reference,
-                                   **params).y_noisy
+                                   reference_groups=reference_groups, **params).y_noisy
 
     # ------------------------------------------------------------------
     # THE PER-MOLECULE SCALE, WITHOUT DRAWING
     # ------------------------------------------------------------------
     def noise_scale(self, y: np.ndarray, dose: float,
                     reference: Optional[np.ndarray] = None,
-                    groups: Optional[np.ndarray] = None, **params) -> np.ndarray:
+                    groups: Optional[np.ndarray] = None,
+                    reference_groups: Optional[np.ndarray] = None,
+                    **params) -> np.ndarray:
         """The noise scale each molecule's region receives, without corrupting it.
 
         This is what scores held-out molecules against the pattern the TRAINING
-        labels were exposed to -- pass reference=y_train and the training group
-        assignment. It is the input to the "does the model learn where the data
-        is unreliable" question.
+        labels were exposed to. Pass BOTH `reference=y_train` (which fixes any
+        label cut-point) AND `reference_groups=<the training group array>`
+        (which fixes which groups were selected). Passing only the first leaves
+        the group selection to be re-run over the held-out molecules, which
+        picks a different set of groups -- the pattern would then describe an
+        injection that never happened.
+
+        It is the input to the "does the model learn where the data is
+        unreliable" question.
 
         For the three shape-only conditions the scale is the same for every
         molecule, so that question is UNDEFINED there rather than answered with
@@ -670,7 +696,8 @@ class NoiseInjectorRegression:
         if self.strategy == 'grouped_shifted':
             return np.full(len(y), dose)
 
-        scales, _ = self.scale_map(y, groups=groups, **params)
+        scales, _ = self.scale_map(y, groups=groups,
+                                   reference_groups=reference_groups, **params)
         if dose == 0.0:
             return np.zeros(len(y))
         g = self.unit_dose(scales, **params)
