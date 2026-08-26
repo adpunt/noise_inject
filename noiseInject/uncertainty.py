@@ -56,6 +56,10 @@ def calculate_uncertainty_metrics(
                       unc_noise_rho when injected noise is provided.
         summary_df: Aggregate metrics. Slopes of each quantity vs sigma (slope_*),
                     clean baselines (baseline_*), and mean coverage / miscoverage.
+                    Also ``unc_noise_rho_pooled`` when injected noise is
+                    provided -- see the warning at its computation: it measures
+                    a population trend across levels, NOT per-sample detection,
+                    for which the per-level ``unc_noise_rho`` is the right column.
     """
     y_true = np.asarray(y_true).flatten()
 
@@ -114,10 +118,24 @@ def calculate_uncertainty_metrics(
             np.mean(np.abs(per_sigma_df[col].values - COVERAGE_TARGETS[k]))
         )
 
-    # Pooled uncertainty-noise correlation across all levels. Within a single level,
-    # feature-independent noise is not per-sample detectable (per-level rho ~ 0); the
-    # signal lives across levels, where higher sigma raises both injected noise and
-    # predicted uncertainty. This pooled value is the paper's noise-tracking metric.
+    # Pooled uncertainty-noise correlation, across all levels at once.
+    #
+    # ⚠️ READ THIS BEFORE USING IT. Pooling stacks the levels into a staircase:
+    # mean uncertainty rises with the level and so does the mean size of the
+    # injected noise, so this correlation reports that shared ramp -- a
+    # POPULATION trend -- and it is very easily read as per-molecule detection.
+    # It is not. Recomputed WITHIN each level, the result it produced reversed:
+    # a Gaussian process, whose single global observation-noise term cannot be
+    # per-molecule, came out at approximately zero at every level.
+    #
+    # The per-level value is `unc_noise_rho` in per_sigma_df, computed above.
+    # That is the one to use for "can uncertainty tell me WHICH labels are bad".
+    # This one answers a different and much weaker question: does uncertainty go
+    # up when the whole dataset gets noisier. Keep them apart, and never report
+    # one under the other's description.
+    #
+    # An earlier version of this comment claimed the pooled value was the
+    # noise-tracking metric to use. That was wrong and is why the note is here.
     if has_noise_tracking:
         eps_all = np.concatenate([
             np.abs(np.asarray(injected_noise[s]).flatten())
@@ -127,6 +145,7 @@ def calculate_uncertainty_metrics(
             np.asarray(noise_uncertainties[s]).flatten()
             for s in sigma_values if s in noise_uncertainties
         ])
+        # Named `_pooled` so it cannot be mistaken for the per-level column.
         summary['unc_noise_rho_pooled'] = _spearman(u_all, eps_all)
 
     summary_df = pd.DataFrame([summary])
