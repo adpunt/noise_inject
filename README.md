@@ -15,26 +15,28 @@ pip install -e .
 
 ### Regression
 ```python
-from noiseInject import NoiseInjectorRegression, calibrate_sigma, calculate_noise_metrics
+from noiseInject import NoiseInjectorRegression, calculate_noise_metrics
 from sklearn.ensemble import RandomForestRegressor
 
-# Calibrate sigma for target effective noise
-sigma = calibrate_sigma(y_train, target_effective_noise=0.1)
-
-# Test at multiple noise levels
-injector = NoiseInjectorRegression('legacy', random_state=42)
+# The noise level is the amount of noise you want DELIVERED -- the
+# root-mean-square error added, in the label's own units. Each condition solves
+# for its own internal scale to hit it. There is no calibration step.
+sd = y_train.std()
 predictions = {}
 
-for mult in [0.0, 1.0, 2.0]:
-    y_noisy = injector.inject(y_train, sigma * mult) if mult > 0 else y_train
-    model = RandomForestRegressor()
-    model.fit(X_train, y_noisy)
-    predictions[sigma * mult] = model.predict(X_test)
+for k in [0.0, 0.2, 0.3, 0.5, 0.75, 1.0]:
+    injector = NoiseInjectorRegression.from_condition('gaussian', random_state=42)
+    result = injector.inject_verbose(y_train, dose=k * sd)
+    model = RandomForestRegressor().fit(X_train, result.y_noisy)
+    predictions[k] = model.predict(X_test)
+    print(result.as_row())      # what was actually delivered, for the record
 
 # Analyze robustness
 per_sigma_df, summary_df = calculate_noise_metrics(y_test, predictions)
-print(f"NSI: {summary_df['nsi_r2'].values[0]:.4f}")
-print(f"Retention: {summary_df['retention_pct_r2'].values[0]:.1f}%")
+s = summary_df.iloc[0]
+print(f"auc_norm (R2):  {s['auc_norm_r2']:.4f}   (higher = more robust)")
+print(f"Weibull beta:   {s['weibull_beta_r2']:.2f}   (>1 holds-then-cliff, <1 early collapse)")
+print(f"Retention:      {s['retention_pct_r2']:.1f}%")
 ```
 
 ### Classification
@@ -49,7 +51,7 @@ flip_prob = calibrate_flip_probability(y_train, target_flip_rate=0.1)
 injector = NoiseInjectorClassification('uniform', random_state=42)
 predictions = {}
 
-for mult in [0.0, 1.0, 2.0]:
+for mult in [0.0, 1.0, 2.0, 3.0]:
     y_noisy = injector.inject(y_train, flip_prob * mult) if mult > 0 else y_train
     model = RandomForestClassifier()
     model.fit(X_train, y_noisy)
@@ -57,19 +59,42 @@ for mult in [0.0, 1.0, 2.0]:
 
 # Analyze robustness
 per_flip_df, summary_df, per_class_df = calculate_classification_metrics(y_test, predictions)
-print(f"NSI: {summary_df['nsi_accuracy'].values[0]:.4f}")
-print(f"Retention: {summary_df['retention_pct_accuracy'].values[0]:.1f}%")
+print(f"auc_norm (accuracy): {summary_df['auc_norm_accuracy'].values[0]:.4f}")
+print(f"Retention:           {summary_df['retention_pct_accuracy'].values[0]:.1f}%")
 ```
 
 ## Strategies
 
 ### Regression (continuous noise)
-- **legacy**: Homogeneous Gaussian noise
-- **quantile**: More noise at distribution extremes
-- **threshold**: More noise above/below thresholds
-- **outlier**: More noise for z-score outliers
-- **hetero**: Heteroscedastic (variance ∝ |y|)
-- **valprop**: Value-proportional noise
+
+**Every condition delivers the same amount of noise at a given level.** That is the
+point: comparing conditions at a common nominal *setting* compares amount, not
+shape. The six strategies this replaced delivered between 0.49× and 2.00× the same
+amount at one setting, and their entire apparent severity ordering was explained by
+that. Four of them also assumed error depends on the measured value, which has been
+directly tested on 16,844 repeat measurements and refuted.
+
+Shape and targeting are chosen separately.
+
+*Shape* (`distribution`) — how each draw is distributed:
+- **gaussian**: the reference case
+- **student_t**: heavy-tailed, `nu > 2`. Gaussian is its `nu → ∞` limit, so the two nest
+- **laplace**: the shape actually fitted to real bioactivity measurement disagreements
+
+*Targeting* (`strategy`) — who gets hit, and how hard:
+- **uniform**: every record gets the same scale
+- **grouped_wider**: records in some groups get a wider error, still centred on the truth
+- **grouped_shifted**: whole groups are pushed in one direction by a constant
+- **outlier**: a randomly chosen fraction get a wider error. Selection is *random*, not
+  by value — a mistyped unit is a property of the record, not of the value
+- **censoring**: values past a limit are recorded as the limit. The only condition that
+  is neither zero-mean nor dose-matched, so it takes a censored *fraction* rather than a dose
+
+`CONDITIONS` names each combination the study runs (`gaussian`, `student_t_nu5`,
+`grouped_shifted`, `outlier_p05`, `censoring_25`, …); `from_condition` builds one.
+`inject_verbose` returns the noisy labels together with the noise actually drawn per
+record and the provenance — unit dose, solved scale, delivered dose, affected fraction —
+so no downstream figure is ever untraceable to the amount of noise that produced it.
 
 ### Classification (label flips)
 - **uniform**: Equal flip probability for all
@@ -81,9 +106,23 @@ print(f"Retention: {summary_df['retention_pct_accuracy'].values[0]:.1f}%")
 
 ## Key Metrics
 
-- **NSI (Noise Sensitivity Index)**: Slope of performance vs noise. More negative = less robust.
-- **Retention**: Performance preservation at high noise. Higher = more robust.
+Robustness is read off the **retention curve** `ret(x) = metric(x) / metric(0)` (higher-is-better
+skill metrics only: R² for regression; accuracy/F1/precision/recall for classification):
+
+- **auc_norm** (primary): normalised area under the retention curve — the mean fraction of
+  baseline skill retained across the noise sweep. Higher = more robust (~[0, 1]), decoupled from
+  baseline performance. Replaces the old NSI slope, which mischaracterised a nonlinear
+  degradation curve and was coupled to baseline skill.
+- **Weibull β / τ** (supplementary): fit `ret ≈ exp(-(x/τ)^β)`; β is the *shape* of failure
+  (β>1 = holds-then-cliff, β<1 = early collapse then plateau), τ the decay scale. Only meaningful
+  once the model genuinely degrades, and needs ≥4 noise levels to fit.
+- **Retention**: Performance preservation at the highest noise level. Higher = more robust.
 - **Baseline**: Performance with clean labels (σ=0 or flip_prob=0).
+
+`curve_stable_*` flags a single curve that dipped below 0 retention (a collapsed retrain makes
+auc_norm untrustworthy). Curve metrics are most reliable when `predictions` is built from
+**seed-averaged** per-noise-level performance; pass `baseline_threshold=` (e.g. 0.3) to NaN-out
+models too weak to have meaningful degradation.
 
 ## Uncertainty Quantification
 

@@ -9,7 +9,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="noiseInject",
-    version="0.3.0",
+    version="1.0.0",
     author="Adelaide Punt",
     description="Framework for testing ML model robustness to label noise",
     long_description=long_description,

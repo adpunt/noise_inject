@@ -2,243 +2,586 @@
 NoiseInject Core Module
 Implements noise injection strategies for ML robustness testing
 Supports both regression (continuous noise) and classification (label flips)
+
+REGRESSION: THE DOSE IS THE RESULT, NOT THE KNOB
+------------------------------------------------
+Every regression condition solves for its own internal scale so that the
+root-mean-square noise actually added equals the requested `dose`, in the
+label's own units. Comparing conditions at a common nominal setting -- the
+previous behaviour -- compares amount, not shape: the six superseded
+strategies delivered between 0.49x and 2.00x the same amount of noise at one
+setting, and their entire apparent severity ordering was explained by that.
+
+The specification is `NOISE_DESIGN.md` in the qsar_qm_models repository
+(sections 1, 2 and 6). It is implemented twice -- here and in
+`rust/src/main.rs` -- and the two implementations are held together by an
+executable cross-check (`scripts/crosscheck_injectors.py`, gate 2 of
+`RERUN_PLAN.md` section 8), because they have silently drifted apart before.
+
+Shape and targeting are separately selectable, mirroring the Rust side:
+
+    distribution  -- the shape of each draw: gaussian, student_t, laplace
+    strategy      -- who gets hit and how hard: uniform, grouped_wider,
+                     grouped_shifted, outlier, censoring
+
+Censoring is the one condition that is neither zero-mean nor dose-matched; it
+is parameterised by the fraction of labels clipped and reports its delivered
+dose as a diagnostic.
 """
 
+import math
+from typing import Any, Dict, Optional, Tuple, Union
+
 import numpy as np
-from typing import Optional, Dict, Any, Union
+
+# ---------------------------------------------------------------------------
+# The condition registry
+# ---------------------------------------------------------------------------
+# One string per run condition, so a job script, a results row and a figure
+# label all carry the same name. Every entry maps to a (strategy,
+# distribution, parameters) triple.
+#
+# Parameter provenance (NOISE_DESIGN.md section 2):
+#   lambda = 3      within-laboratory error must be multiplied by about three
+#                   to reach between-laboratory error (Avdeef 2019, corroborated
+#                   by Llinas & Avdeef 2019 and Kalliokoski et al. 2013)
+#   p = 1-10%       "for scientific routine data, not taken with utmost care,
+#                   their fraction is typically between 1 percent and 10
+#                   percent" (Hampel 2001)
+#   group_fraction  no published number exists; 0.2 is a choice and is declared
+#                   as one
+#   rho = 0.62      share of total measurement variance carried by the
+#                   group-level term (Bentz et al. 2013, Table 7)
+
+CONDITIONS: Dict[str, Dict[str, Any]] = {
+    'gaussian':        dict(strategy='uniform',         distribution='gaussian'),
+    'student_t_nu10':  dict(strategy='uniform',         distribution='student_t', nu=10.0),
+    'student_t_nu5':   dict(strategy='uniform',         distribution='student_t', nu=5.0),
+    'student_t_nu3':   dict(strategy='uniform',         distribution='student_t', nu=3.0),
+    'laplace':         dict(strategy='uniform',         distribution='laplace'),
+    'grouped_wider':   dict(strategy='grouped_wider',   distribution='gaussian', lam=3.0, group_fraction=0.2),
+    'grouped_shifted': dict(strategy='grouped_shifted', distribution='gaussian', rho=0.62),
+    'outlier_p01':     dict(strategy='outlier',         distribution='gaussian', p=0.01, lam=3.0),
+    'outlier_p05':     dict(strategy='outlier',         distribution='gaussian', p=0.05, lam=3.0),
+    'outlier_p10':     dict(strategy='outlier',         distribution='gaussian', p=0.10, lam=3.0),
+    'censoring_10':    dict(strategy='censoring',       distribution='gaussian', censored_fraction=0.10),
+    'censoring_20':    dict(strategy='censoring',       distribution='gaussian', censored_fraction=0.20),
+    'censoring_25':    dict(strategy='censoring',       distribution='gaussian', censored_fraction=0.25),
+    'censoring_30':    dict(strategy='censoring',       distribution='gaussian', censored_fraction=0.30),
+    'censoring_40':    dict(strategy='censoring',       distribution='gaussian', censored_fraction=0.40),
+    'censoring_50':    dict(strategy='censoring',       distribution='gaussian', censored_fraction=0.50),
+}
+
+REGRESSION_STRATEGIES = ('uniform', 'grouped_wider', 'grouped_shifted', 'outlier', 'censoring')
+REGRESSION_DISTRIBUTIONS = ('gaussian', 'student_t', 'laplace')
+
+# Conditions whose per-molecule noise scale is the same for every molecule.
+# For these the question "which region of the label space is unreliable" is
+# undefined rather than answered with zero -- see `InjectionResult.scale_is_degenerate`.
+_CONSTANT_SCALE_STRATEGIES = ('uniform',)
+
+
+class InjectionResult:
+    """Everything one injection produced, including its provenance.
+
+    The single reason the dose confound went unnoticed for the life of the
+    project is that nothing recorded how much noise was actually delivered.
+    Every field below exists to be written to a results row
+    (`RERUN_PLAN.md` section 5.2).
+    """
+
+    __slots__ = ('y_clean', 'y_noisy', 'epsilon', 'noise_scale', 'condition',
+                 'strategy', 'distribution', 'params', 'target_dose',
+                 'unit_dose', 'solved_scale', 'delivered_dose',
+                 'delivered_dose_fraction_of_sd', 'affected_molecule_fraction',
+                 'mean_shift', 'n_groups', 'largest_group_share', 'seed',
+                 'scale_is_degenerate', 'censoring_limit')
+
+    def __init__(self, **kwargs):
+        for name in self.__slots__:
+            setattr(self, name, kwargs.get(name))
+
+    def as_row(self) -> Dict[str, Any]:
+        """The provenance fields, for writing beside every result."""
+        return {
+            'condition': self.condition,
+            'strategy': self.strategy,
+            'distribution': self.distribution,
+            'target_dose': self.target_dose,
+            'unit_dose': self.unit_dose,
+            'solved_scale': self.solved_scale,
+            'delivered_dose': self.delivered_dose,
+            'delivered_dose_fraction_of_sd': self.delivered_dose_fraction_of_sd,
+            'affected_molecule_fraction': self.affected_molecule_fraction,
+            'mean_shift': self.mean_shift,
+            'n_groups': self.n_groups,
+            'largest_group_share': self.largest_group_share,
+            'censoring_limit': self.censoring_limit,
+            'seed': self.seed,
+            'scale_is_degenerate': self.scale_is_degenerate,
+        }
+
+    def __iter__(self):
+        """Backwards-compatible unpacking: y_noisy, noise_scale, epsilon."""
+        return iter((self.y_noisy, self.noise_scale, self.epsilon))
+
+    def __repr__(self):
+        return (f"InjectionResult(condition={self.condition!r}, "
+                f"target_dose={self.target_dose:.4g}, "
+                f"delivered_dose={self.delivered_dose:.4g}, "
+                f"affected={self.affected_molecule_fraction:.4g})")
 
 
 class NoiseInjectorRegression:
     """
-    Inject noise into continuous target values using various strategies.
-    
-    Strategies:
-        - legacy: Simple Gaussian σ * N(0,1)
-        - quantile: More noise at distribution extremes
-        - threshold: More noise above/below absolute thresholds
-        - outlier: More noise for z-score outliers
-        - hetero: Heteroscedastic noise (variance ∝ |y|)
-        - valprop: Value-proportional noise
+    Inject dose-matched noise into continuous target values.
+
+    Shape (`distribution`):
+        - gaussian:  the reference case
+        - student_t: heavy-tailed; nu must exceed 2 or the variance -- and so
+                     "the same amount of noise" -- is undefined
+        - laplace:   the shape actually fitted to real bioactivity error
+
+    Targeting (`strategy`):
+        - uniform:         every molecule gets the same scale
+        - grouped_wider:   molecules in a fraction of groups get a wider error,
+                           still centred on the true value
+        - grouped_shifted: every group's labels are pushed in one direction by
+                           a constant, plus a within-molecule error
+        - outlier:         a randomly chosen fraction get a wider error.
+                           Selection is RANDOM, not by label value: a mistyped
+                           unit is a property of the record, not of the value
+        - censoring:       values past a limit are recorded as the limit.
+                           Not zero-mean, not dose-matched
+
+    The `dose` argument to `inject`/`inject_verbose` is the root-mean-square
+    noise to deliver, in the label's own units. The RMS is the right moment to
+    match because R-squared and RMSE are second-moment quantities.
+
+    Reproducibility: a fresh generator is built per instance and advanced by
+    every draw, so calling inject() twice on one instance gives different
+    noise. Callers that need a deterministic realisation construct a fresh
+    injector per call.
     """
-    
-    def __init__(self, strategy: str = 'legacy', random_state: Optional[int] = None):
+
+    def __init__(self, strategy: str = 'uniform', distribution: str = 'gaussian',
+                 random_state: Optional[int] = None, **params):
         """
-        Initialize NoiseInjectorRegression.
-        
         Args:
-            strategy: One of ['legacy', 'quantile', 'threshold', 'outlier', 'hetero', 'valprop']
-            random_state: Random seed for reproducibility
+            strategy: one of REGRESSION_STRATEGIES
+            distribution: one of REGRESSION_DISTRIBUTIONS
+            random_state: seed
+            **params: condition parameters (nu, lam, group_fraction, rho, p,
+                      censored_fraction, side). May also be supplied per call.
         """
-        valid_strategies = ['legacy', 'quantile', 'threshold', 'outlier', 'hetero', 'valprop']
-        if strategy not in valid_strategies:
-            raise ValueError(f"Strategy must be one of {valid_strategies}")
-        
+        if strategy not in REGRESSION_STRATEGIES:
+            raise ValueError(f"strategy must be one of {REGRESSION_STRATEGIES}, got {strategy!r}")
+        if distribution not in REGRESSION_DISTRIBUTIONS:
+            raise ValueError(f"distribution must be one of {REGRESSION_DISTRIBUTIONS}, got {distribution!r}")
+
+        nu = params.get('nu')
+        if distribution == 'student_t':
+            if nu is None:
+                raise ValueError("student_t requires nu")
+            if float(nu) <= 2.0:
+                raise ValueError(
+                    f"student_t requires nu > 2 (got {nu}); at nu <= 2 the variance is "
+                    "undefined and dose matching stops meaning anything")
+
         self.strategy = strategy
+        self.distribution = distribution
+        self.params = dict(params)
+        self.random_state = random_state
         self.rng = np.random.RandomState(random_state)
-    
-    def inject(self, y: np.ndarray, sigma: float, **strategy_params) -> np.ndarray:
-        """
-        Inject noise into target values.
-        
-        Args:
-            y: Target values (1D numpy array)
-            sigma: Base noise level
-            **strategy_params: Strategy-specific parameters
-        
-        Returns:
-            Noisy target values
+
+    # ------------------------------------------------------------------
+    @classmethod
+    def from_condition(cls, condition: str, random_state: Optional[int] = None):
+        """Build from a registry name, e.g. 'student_t_nu5' or 'censoring_25'."""
+        if condition not in CONDITIONS:
+            raise ValueError(f"unknown condition {condition!r}; known: {sorted(CONDITIONS)}")
+        spec = dict(CONDITIONS[condition])
+        strategy = spec.pop('strategy')
+        distribution = spec.pop('distribution')
+        inj = cls(strategy=strategy, distribution=distribution,
+                  random_state=random_state, **spec)
+        inj.condition = condition
+        return inj
+
+    @property
+    def condition(self) -> str:
+        """The registry name for this configuration, if it has one."""
+        if getattr(self, '_condition', None):
+            return self._condition
+        for name, spec in CONDITIONS.items():
+            if spec['strategy'] != self.strategy or spec['distribution'] != self.distribution:
+                continue
+            rest = {k: v for k, v in spec.items() if k not in ('strategy', 'distribution')}
+            if all(float(self.params.get(k, float('nan'))) == float(v) for k, v in rest.items()):
+                return name
+        return f"{self.strategy}/{self.distribution}"
+
+    @condition.setter
+    def condition(self, value):
+        self._condition = value
+
+    # ------------------------------------------------------------------
+    # SHAPE
+    # ------------------------------------------------------------------
+    def _shape_unit_sd(self, **params) -> float:
+        """The standard deviation of one unscaled draw from the shape."""
+        if self.distribution == 'student_t':
+            nu = float(self._param('nu', params))
+            return math.sqrt(nu / (nu - 2.0))
+        if self.distribution == 'laplace':
+            return math.sqrt(2.0)
+        return 1.0
+
+    def _draw_shape(self, n: int, **params) -> np.ndarray:
+        """n draws from the shape, at its natural scale (unit_sd as above)."""
+        if self.distribution == 'student_t':
+            nu = float(self._param('nu', params))
+            z = self.rng.standard_normal(n)
+            v = self.rng.chisquare(nu, size=n)
+            return z / np.sqrt(v / nu)
+        if self.distribution == 'laplace':
+            # Inverse transform, unit scale b = 1 -> sd = sqrt(2)
+            u = self.rng.random_sample(n) - 0.5
+            return -np.sign(u) * np.log1p(-2.0 * np.abs(u))
+        return self.rng.standard_normal(n)
+
+    def _param(self, name: str, params: Dict[str, Any], default=None):
+        if name in params and params[name] is not None:
+            return params[name]
+        if name in self.params and self.params[name] is not None:
+            return self.params[name]
+        if default is not None:
+            return default
+        raise ValueError(f"{self.strategy}/{self.distribution} requires parameter {name!r}")
+
+    # ------------------------------------------------------------------
+    # TARGETING -- the per-molecule scale map
+    # ------------------------------------------------------------------
+    def scale_map(self, y: np.ndarray, groups: Optional[np.ndarray] = None,
+                  **params) -> Tuple[np.ndarray, float]:
+        """Per-molecule multipliers at unit scale, and the affected fraction.
+
+        Draws from the generator for the two selection rules (which groups,
+        which records), and is pure for the rest.
         """
         y = np.asarray(y).flatten()
-        
-        if self.strategy == 'legacy':
-            return self._legacy(y, sigma)
-        elif self.strategy == 'quantile':
-            return self._quantile(y, sigma, **strategy_params)
-        elif self.strategy == 'threshold':
-            return self._threshold(y, sigma, **strategy_params)
-        elif self.strategy == 'outlier':
-            return self._outlier(y, sigma, **strategy_params)
-        elif self.strategy == 'hetero':
-            return self._hetero(y, sigma, **strategy_params)
-        elif self.strategy == 'valprop':
-            return self._valprop(y, sigma, **strategy_params)
-    
-    # ------------------------------------------------------------------
-    # PER-MOLECULE NOISE SCALE
-    # ------------------------------------------------------------------
-    # Every strategy below works the same way: it computes a per-molecule
-    # noise scale sigma_i from the label, then draws noise ~ N(0, 1) and
-    # multiplies. The `_scale_*` methods return sigma_i WITHOUT touching the
-    # random number generator, so the scale can be computed for molecules that
-    # are never actually corrupted (e.g. a held-out test set) in order to ask
-    # "how noisy is this molecule's region of the label distribution?".
-    #
-    # `reference` is the array whose distribution defines the cut-points
-    # (quantiles for `quantile`, mean/sd for `outlier`). It defaults to `y`
-    # itself, which reproduces the original behaviour exactly. To score
-    # held-out molecules against the noise pattern the TRAINING labels were
-    # exposed to, pass reference=y_train.
-    #
-    # NOTE ON REPRODUCIBILITY: `_legacy` previously drew
-    # rng.normal(0, sigma, n); it now draws rng.normal(0, 1, n) * sigma_i.
-    # These are bit-identical for numpy RandomState (verified), so results
-    # generated before and after this refactor match exactly.
+        n = len(y)
 
-    def _scale_legacy(self, y, sigma):
-        return np.full(len(y), float(sigma))
+        if self.strategy == 'uniform':
+            return np.ones(n), 0.0
 
-    def _scale_quantile(self, y, sigma, reference=None,
-                        high_quantile: float = 0.9,
-                        low_quantile: float = 0.1,
-                        high_sigma_mult: float = 2.0,
-                        low_sigma_mult: float = 2.0,
-                        mid_sigma_mult: float = 0.1):
-        ref = y if reference is None else np.asarray(reference).flatten()
-        high_thresh = np.quantile(ref, high_quantile)
-        low_thresh = np.quantile(ref, low_quantile)
-        sigma_values = np.full(len(y), sigma * mid_sigma_mult)
-        sigma_values[y >= high_thresh] = sigma * high_sigma_mult
-        sigma_values[y <= low_thresh] = sigma * low_sigma_mult
-        return sigma_values
+        if self.strategy == 'grouped_wider':
+            lam = float(self._param('lam', params))
+            f = float(self._param('group_fraction', params))
+            groups = self._require_groups(groups, n)
+            affected = self._select_groups_by_molecule_fraction(groups, f)
+            scales = np.where(affected, lam, 1.0)
+            return scales, float(affected.mean())
 
-    def _scale_threshold(self, y, sigma, reference=None,
-                         high_threshold: float = 1.0,
-                         low_threshold: float = -1.0,
-                         high_sigma_mult: float = 2.0,
-                         low_sigma_mult: float = 2.0,
-                         mid_sigma_mult: float = 0.1):
-        # Absolute cut-points: independent of the reference distribution.
-        sigma_values = np.full(len(y), sigma * mid_sigma_mult)
-        sigma_values[y >= high_threshold] = sigma * high_sigma_mult
-        sigma_values[y <= low_threshold] = sigma * low_sigma_mult
-        return sigma_values
+        if self.strategy == 'grouped_shifted':
+            # The scale map is uniform; the group structure enters as an
+            # additive offset in `_draw_epsilon`, not as a multiplier.
+            return np.ones(n), 1.0
 
-    def _scale_outlier(self, y, sigma, reference=None,
-                       outlier_z_threshold: float = 2.0,
-                       outlier_sigma_mult: float = 3.0,
-                       normal_sigma_mult: float = 0.1):
-        ref = y if reference is None else np.asarray(reference).flatten()
-        z_scores = np.abs((y - np.mean(ref)) / np.std(ref))
-        sigma_values = np.full(len(y), sigma * normal_sigma_mult)
-        sigma_values[z_scores > outlier_z_threshold] = sigma * outlier_sigma_mult
-        return sigma_values
-
-    def _scale_hetero(self, y, sigma, reference=None,
-                      alpha_mult: float = 0.1,
-                      beta_mult: float = 0.05):
-        alpha = sigma * sigma * alpha_mult
-        beta = sigma * sigma * beta_mult
-        return np.sqrt(alpha + beta * np.abs(y))
-
-    def _scale_valprop(self, y, sigma, reference=None,
-                       proportionality_factor: float = 0.05):
-        return sigma * (1 + proportionality_factor * np.abs(y))
-
-    def noise_scale(self, y: np.ndarray, sigma: float,
-                    reference: Optional[np.ndarray] = None,
-                    **strategy_params) -> np.ndarray:
-        """Per-molecule noise scale sigma_i, with NO noise drawn.
-
-        Pure function of the labels. Does not advance the random number
-        generator, so it is safe to call at any point without changing what
-        `inject` would produce.
-
-        Args:
-            y: labels to compute a scale for.
-            reference: distribution defining the cut-points (see note above).
-                Ignored by strategies whose scale is a pointwise function of y.
-            **strategy_params: same overrides accepted by `inject`.
-
-        Returns:
-            Array of per-molecule noise standard deviations, same length as y.
-        """
-        y = np.asarray(y).flatten()
-        if self.strategy == 'legacy':
-            return self._scale_legacy(y, sigma)
-        if self.strategy == 'quantile':
-            return self._scale_quantile(y, sigma, reference, **strategy_params)
-        if self.strategy == 'threshold':
-            return self._scale_threshold(y, sigma, reference, **strategy_params)
         if self.strategy == 'outlier':
-            return self._scale_outlier(y, sigma, reference, **strategy_params)
-        if self.strategy == 'hetero':
-            return self._scale_hetero(y, sigma, reference, **strategy_params)
-        if self.strategy == 'valprop':
-            return self._scale_valprop(y, sigma, reference, **strategy_params)
-        raise ValueError(f"Unknown strategy: {self.strategy}")
+            lam = float(self._param('lam', params))
+            p = float(self._param('p', params))
+            hit = self.rng.random_sample(n) < p
+            scales = np.where(hit, lam, 1.0)
+            return scales, float(hit.mean())
 
-    def inject_verbose(self, y: np.ndarray, sigma: float,
+        if self.strategy == 'censoring':
+            # Not dose-matched; the scale map is not used to solve anything.
+            return np.ones(n), float(self._param('censored_fraction', params))
+
+        raise AssertionError(f"unhandled strategy {self.strategy!r}")
+
+    @staticmethod
+    def _require_groups(groups, n):
+        if groups is None:
+            raise ValueError(
+                "grouped noise needs a group assignment: pass groups=<array of ints>, "
+                "one per molecule (e.g. from assign_scaffold_groups)")
+        groups = np.asarray(groups).flatten()
+        if len(groups) != n:
+            raise ValueError(f"groups has length {len(groups)}, labels have {n}")
+        return groups
+
+    def _select_groups_by_molecule_fraction(self, groups: np.ndarray, f: float) -> np.ndarray:
+        """Choose whole groups until the affected MOLECULE fraction is closest to f.
+
+        Selecting a fraction of *groups* is what the first draft did, and it does
+        not control who gets hit: real Murcko scaffolds are very unevenly sized.
+        Measured on 10,000 QM9 molecules, where 32% share one empty (acyclic)
+        scaffold, a nominal group fraction of 0.2 delivered an affected molecule
+        fraction anywhere between 0.067 and 0.551. So select by molecule count,
+        stop at the closest approach to f, and record what was realised.
+        """
+        uniq, inverse = np.unique(groups, return_inverse=True)
+        sizes = np.bincount(inverse, minlength=len(uniq))
+        n = len(groups)
+        order = self.rng.permutation(len(uniq))
+
+        chosen = []
+        cum = 0
+        for g in order:
+            if cum > 0 and abs((cum + sizes[g]) / n - f) > abs(cum / n - f):
+                continue  # this group overshoots; try a smaller one
+            chosen.append(g)
+            cum += sizes[g]
+            if cum / n >= f:
+                break
+        chosen_set = np.zeros(len(uniq), dtype=bool)
+        chosen_set[chosen] = True
+        return chosen_set[inverse]
+
+    # ------------------------------------------------------------------
+    # THE DOSE SOLVER
+    # ------------------------------------------------------------------
+    def unit_dose(self, scales: np.ndarray, **params) -> float:
+        """G -- the root-mean-square of the scale map times the shape's unit sd.
+
+        The scale that delivers a target dose tau is then simply tau / G.
+        """
+        scales = np.asarray(scales, dtype=float)
+        return float(np.sqrt(np.mean(scales ** 2)) * self._shape_unit_sd(**params))
+
+    # ------------------------------------------------------------------
+    # INJECTION
+    # ------------------------------------------------------------------
+    def inject_verbose(self, y: np.ndarray, dose: float,
+                       groups: Optional[np.ndarray] = None,
                        reference: Optional[np.ndarray] = None,
-                       **strategy_params):
-        """`inject`, but it also hands back what it did.
+                       **params) -> InjectionResult:
+        """Inject noise and return it with everything needed to trace it.
 
-        Returns:
-            y_noisy: the corrupted labels (identical to `inject` for the same
-                RNG state).
-            sigma_i: the per-molecule noise scale actually applied.
-            epsilon: the noise actually added to each molecule.
-
-        This is the entry point for any analysis that asks whether a model's
-        predicted uncertainty tracks the corruption, because it is the only
-        way to know per molecule how much corruption there was.
-        """
-        y = np.asarray(y).flatten()
-        sigma_i = self.noise_scale(y, sigma, reference, **strategy_params)
-        epsilon = self.rng.normal(0, 1, size=len(y)) * sigma_i
-        return y + epsilon, sigma_i, epsilon
-
-    def _legacy(self, y: np.ndarray, sigma: float) -> np.ndarray:
-        """Simple Gaussian: y_noisy = y + sigma * N(0,1)"""
-        return y + self.rng.normal(0, 1, size=len(y)) * self._scale_legacy(y, sigma)
-
-    def _quantile(self, y: np.ndarray, sigma: float, **p) -> np.ndarray:
-        """More noise at distribution extremes."""
-        return y + self.rng.normal(0, 1, size=len(y)) * self._scale_quantile(y, sigma, None, **p)
-
-    def _threshold(self, y: np.ndarray, sigma: float, **p) -> np.ndarray:
-        """More noise above/below absolute thresholds."""
-        return y + self.rng.normal(0, 1, size=len(y)) * self._scale_threshold(y, sigma, None, **p)
-
-    def _outlier(self, y: np.ndarray, sigma: float, **p) -> np.ndarray:
-        """More noise for z-score outliers."""
-        return y + self.rng.normal(0, 1, size=len(y)) * self._scale_outlier(y, sigma, None, **p)
-
-    def _hetero(self, y: np.ndarray, sigma: float, **p) -> np.ndarray:
-        """Heteroscedastic noise: sigma_i = sqrt(alpha*s^2 + beta*s^2*|y_i|)"""
-        return y + self.rng.normal(0, 1, size=len(y)) * self._scale_hetero(y, sigma, None, **p)
-
-    def _valprop(self, y: np.ndarray, sigma: float, **p) -> np.ndarray:
-        """Value-proportional: sigma_i = sigma * (1 + f * |y_i|)"""
-        return y + self.rng.normal(0, 1, size=len(y)) * self._scale_valprop(y, sigma, None, **p)
-
-    def get_effective_noise(self, y_clean: np.ndarray, y_noisy: np.ndarray, 
-                           method: str = 'std_normalized') -> float:
-        """
-        Calculate effective noise level.
-        
         Args:
-            y_clean: Original clean values
-            y_noisy: Noisy values
-            method: One of ['std_normalized', 'range_normalized', 'absolute']
-        
+            y: clean labels
+            dose: target root-mean-square noise, in the label's own units.
+                  Ignored by censoring, which is parameterised by the fraction
+                  of labels clipped.
+            groups: integer group id per molecule; required by the two grouped
+                    conditions
+            reference: the labels whose distribution defines any cut-point.
+                       Defaults to y. Pass the TRAINING labels to score
+                       held-out molecules against the pattern the training set
+                       was exposed to.
+
         Returns:
-            Effective noise level
+            InjectionResult. It also unpacks as (y_noisy, noise_scale, epsilon)
+            for callers that want the three arrays.
         """
-        y_clean = np.asarray(y_clean).flatten()
-        y_noisy = np.asarray(y_noisy).flatten()
-        
-        absolute_diff = np.mean(np.abs(y_noisy - y_clean))
-        
-        if method == 'absolute':
-            return absolute_diff
-        elif method == 'std_normalized':
-            std = np.std(y_clean)
-            return absolute_diff / std if std > 1e-10 else 0.0
-        elif method == 'range_normalized':
-            range_val = np.ptp(y_clean)
-            return absolute_diff / range_val if range_val > 1e-10 else 0.0
+        y = np.asarray(y, dtype=float).flatten()
+        n = len(y)
+        dose = float(dose)
+        if dose < 0:
+            raise ValueError(f"dose must be non-negative, got {dose}")
+
+        ref = y if reference is None else np.asarray(reference, dtype=float).flatten()
+        n_groups, largest_share = self._group_summary(groups)
+
+        if self.strategy == 'censoring':
+            return self._inject_censoring(y, ref, n_groups, largest_share, **params)
+
+        # Zero dose is exactly zero. Not a small number -- the negative control
+        # the old reconstruction never had.
+        if dose == 0.0:
+            zeros = np.zeros(n)
+            return self._result(y, zeros, zeros, dose, unit_dose=float('nan'),
+                                solved_scale=0.0, affected=0.0,
+                                n_groups=n_groups, largest_share=largest_share,
+                                params=params)
+
+        scales, affected = self.scale_map(y, groups=groups, **params)
+        g = self.unit_dose(scales, **params)
+        solved = dose / g
+
+        if self.strategy == 'grouped_shifted':
+            epsilon = self._draw_grouped_shifted(y, dose, groups, **params)
+            noise_scale = np.full(n, dose)
         else:
-            raise ValueError(f"Invalid method: {method}")
+            epsilon = self._draw_shape(n, **params) * (solved * scales)
+            noise_scale = solved * scales * self._shape_unit_sd(**params)
+
+        return self._result(y, epsilon, noise_scale, dose, unit_dose=g,
+                            solved_scale=solved, affected=affected,
+                            n_groups=n_groups, largest_share=largest_share,
+                            params=params)
+
+    def _draw_grouped_shifted(self, y, dose, groups, **params):
+        """Group-level offset plus a within-molecule error.
+
+            eps_i = sqrt(rho)*tau*b_g(i) + sqrt(1-rho)*tau*e_i
+
+        The two variances sum to tau^2 by construction, so the condition is
+        dose-matched without a solver step. rho is the share of total variance
+        carried by the group-level term: 0.62, from Bentz et al. (2013) Table 7,
+        where the laboratory term carries 62% of the variance in log efflux
+        ratio across 23 laboratories.
+
+        The offsets are NOT centred. This condition is not zero-mean in any one
+        run, and that is the mechanism being tested: error pushed in one
+        direction hurts far more than error that scatters.
+        """
+        groups = self._require_groups(groups, len(y))
+        rho = float(self._param('rho', params, default=0.62))
+        if not 0.0 <= rho <= 1.0:
+            raise ValueError(f"rho must lie in [0, 1], got {rho}")
+        uniq, inverse = np.unique(groups, return_inverse=True)
+        b = self._draw_shape(len(uniq), **params)
+        e = self._draw_shape(len(y), **params)
+        return dose * (math.sqrt(rho) * b[inverse] + math.sqrt(1.0 - rho) * e)
+
+    def _inject_censoring(self, y, ref, n_groups, largest_share, **params):
+        """Clip values past an assay limit to the limit itself.
+
+        The most prevalent real mechanism -- Svensson et al. report 25-63% of
+        labels censored in ten of fifteen real industrial assays -- and the only
+        one that biases labels in one direction instead of scattering them.
+        Not zero-mean, so it is not dose-matched; it gets its own axis.
+        """
+        frac = float(self._param('censored_fraction', params))
+        side = str(self._param('side', params, default='upper'))
+        if not 0.0 <= frac < 1.0:
+            raise ValueError(f"censored_fraction must lie in [0, 1), got {frac}")
+
+        if frac == 0.0:
+            zeros = np.zeros(len(y))
+            return self._result(y, zeros, zeros, target_dose=float('nan'),
+                                unit_dose=float('nan'), solved_scale=float('nan'),
+                                affected=0.0, n_groups=n_groups,
+                                largest_share=largest_share, params=params)
+
+        if side == 'upper':
+            limit = float(np.quantile(ref, 1.0 - frac))
+            y_noisy = np.minimum(y, limit)
+        elif side == 'lower':
+            limit = float(np.quantile(ref, frac))
+            y_noisy = np.maximum(y, limit)
+        else:
+            raise ValueError(f"side must be 'upper' or 'lower', got {side!r}")
+
+        epsilon = y_noisy - y
+        # The noise scale of a censored molecule is the distance it was moved;
+        # unlike the zero-mean conditions this is a deterministic function of
+        # the label, which is what makes censoring the label-keyed condition.
+        noise_scale = np.abs(epsilon)
+        return self._result(y, epsilon, noise_scale, target_dose=float('nan'),
+                            unit_dose=float('nan'), solved_scale=float('nan'),
+                            affected=float((epsilon != 0).mean()),
+                            n_groups=n_groups, largest_share=largest_share,
+                            params=params, censoring_limit=limit)
+
+    def _result(self, y, epsilon, noise_scale, target_dose, unit_dose,
+                solved_scale, affected, n_groups, largest_share, params,
+                censoring_limit=None):
+        y_noisy = y + epsilon
+        sd = float(np.std(y))
+        delivered = float(np.sqrt(np.mean(epsilon ** 2)))
+        return InjectionResult(
+            y_clean=y, y_noisy=y_noisy, epsilon=epsilon, noise_scale=noise_scale,
+            condition=self.condition, strategy=self.strategy,
+            distribution=self.distribution,
+            params={**self.params, **params},
+            target_dose=target_dose, unit_dose=unit_dose, solved_scale=solved_scale,
+            delivered_dose=delivered,
+            delivered_dose_fraction_of_sd=(delivered / sd if sd > 1e-12 else float('nan')),
+            affected_molecule_fraction=affected,
+            mean_shift=float(np.mean(epsilon)),
+            n_groups=n_groups, largest_group_share=largest_share,
+            seed=self.random_state, censoring_limit=censoring_limit,
+            scale_is_degenerate=(self.strategy in _CONSTANT_SCALE_STRATEGIES),
+        )
+
+    @staticmethod
+    def _group_summary(groups):
+        if groups is None:
+            return None, None
+        groups = np.asarray(groups).flatten()
+        _, counts = np.unique(groups, return_counts=True)
+        return int(len(counts)), float(counts.max() / len(groups))
+
+    def inject(self, y: np.ndarray, dose: float, groups: Optional[np.ndarray] = None,
+               reference: Optional[np.ndarray] = None, **params) -> np.ndarray:
+        """Inject noise, returning the noisy labels only."""
+        return self.inject_verbose(y, dose, groups=groups, reference=reference,
+                                   **params).y_noisy
+
+    # ------------------------------------------------------------------
+    # THE PER-MOLECULE SCALE, WITHOUT DRAWING
+    # ------------------------------------------------------------------
+    def noise_scale(self, y: np.ndarray, dose: float,
+                    reference: Optional[np.ndarray] = None,
+                    groups: Optional[np.ndarray] = None, **params) -> np.ndarray:
+        """The noise scale each molecule's region receives, without corrupting it.
+
+        This is what scores held-out molecules against the pattern the TRAINING
+        labels were exposed to -- pass reference=y_train and the training group
+        assignment. It is the input to the "does the model learn where the data
+        is unreliable" question.
+
+        For the three shape-only conditions the scale is the same for every
+        molecule, so that question is UNDEFINED there rather than answered with
+        zero. The array is still returned, and `scale_is_degenerate` on an
+        InjectionResult says so; callers must not report a correlation against
+        a constant.
+        """
+        y = np.asarray(y, dtype=float).flatten()
+        dose = float(dose)
+
+        if self.strategy == 'censoring':
+            ref = y if reference is None else np.asarray(reference, dtype=float).flatten()
+            frac = float(self._param('censored_fraction', params))
+            side = str(self._param('side', params, default='upper'))
+            if frac == 0.0:
+                return np.zeros(len(y))
+            if side == 'upper':
+                limit = float(np.quantile(ref, 1.0 - frac))
+                return np.maximum(y - limit, 0.0)
+            limit = float(np.quantile(ref, frac))
+            return np.maximum(limit - y, 0.0)
+
+        if self.strategy == 'grouped_shifted':
+            return np.full(len(y), dose)
+
+        scales, _ = self.scale_map(y, groups=groups, **params)
+        if dose == 0.0:
+            return np.zeros(len(y))
+        g = self.unit_dose(scales, **params)
+        return (dose / g) * scales * self._shape_unit_sd(**params)
+
+    # ------------------------------------------------------------------
+    def get_effective_noise(self, y_clean: np.ndarray, y_noisy: np.ndarray,
+                            method: str = 'rms_normalized') -> float:
+        """Measure the noise that was actually delivered.
+
+        The default is the ROOT-MEAN-SQUARE, in units of the label's spread.
+        The previous default was the mean absolute deviation, which is the
+        first moment; matching it hands the heavy-tailed conditions up to 24%
+        more actual noise than Gaussian at the same nominal setting, because
+        mean|e|/rms is 0.797 for a Gaussian but 0.642 for Student-t at nu = 3.
+        R-squared and RMSE are second-moment quantities, so the second moment
+        is what has to be matched.
+        """
+        y_clean = np.asarray(y_clean, dtype=float).flatten()
+        y_noisy = np.asarray(y_noisy, dtype=float).flatten()
+        eps = y_noisy - y_clean
+        rms = float(np.sqrt(np.mean(eps ** 2)))
+
+        if method == 'rms':
+            return rms
+        if method == 'rms_normalized':
+            sd = float(np.std(y_clean))
+            return rms / sd if sd > 1e-10 else 0.0
+        if method == 'range_normalized':
+            rng = float(np.ptp(y_clean))
+            return rms / rng if rng > 1e-10 else 0.0
+        raise ValueError(f"Invalid method: {method}")
 
 
 class NoiseInjectorClassification:
@@ -513,4 +856,3 @@ class NoiseInjectorClassification:
             cls_flip_rate = np.mean(y_clean[cls_mask] != y_noisy[cls_mask])
             per_class_rates[cls] = cls_flip_rate
         
-        return per_class_rates

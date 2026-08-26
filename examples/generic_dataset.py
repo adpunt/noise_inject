@@ -18,7 +18,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.datasets import fetch_california_housing
 import os
 
-from noiseInject import NoiseInjectorRegression, calculate_noise_metrics, calibrate_sigma
+from noiseInject import NoiseInjectorRegression, calculate_noise_metrics
 
 # Disable multiprocessing
 os.environ['OMP_NUM_THREADS'] = '1'
@@ -95,25 +95,22 @@ def analyze_model_robustness(X_train, y_train, X_test, y_test,
     print(f"ANALYZING: {model_name}")
     print(f"{'='*70}")
     
-    # Calibrate sigma
-    print("\n1. Calibrating sigma for 10% effective noise...")
-    injector = NoiseInjectorRegression('legacy', random_state=42)
-    sigma_cal = calibrate_sigma(y_train, target_effective_noise=0.1, random_state=42)
-    print(f"   Calibrated σ = {sigma_cal:.4f}")
-    
+    # The noise level is the amount DELIVERED, as a fraction of the label
+    # spread. Nothing to calibrate -- each condition solves for its own scale.
+    label_sd = float(np.std(y_train))
+    print(f"\n1. Label spread = {label_sd:.4f}")
+
     # Test at multiple levels
     print("\n2. Testing at multiple noise levels...")
     predictions = {}
-    sigma_multipliers = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
-    
-    for mult in sigma_multipliers:
-        sigma = sigma_cal * mult
-        
+    levels = [0.0, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0]
+
+    for k in levels:
+        sigma = k * label_sd
+
         # Inject noise
-        if mult == 0.0:
-            y_noisy = y_train
-        else:
-            y_noisy = injector.inject(y_train, sigma)
+        injector = NoiseInjectorRegression.from_condition('gaussian', random_state=42)
+        y_noisy = injector.inject(y_train, sigma)
         
         # Train
         model_copy = type(model)(**model.get_params())
@@ -136,7 +133,8 @@ def analyze_model_robustness(X_train, y_train, X_test, y_test,
     print(f"RESULTS FOR {model_name}")
     print(f"{'='*70}")
     print(f"Baseline R²:     {summary['baseline_r2']:.4f}")
-    print(f"NSI (R²):        {summary['nsi_r2']:.4f}")
+    print(f"auc_norm (R²):   {summary['auc_norm_r2']:.4f}")
+    print(f"Weibull β:       {summary['weibull_beta_r2']:.2f}")
     print(f"Retention:       {summary['retention_pct_r2']:.2f}%")
     print(f"{'='*70}")
     
@@ -178,13 +176,13 @@ def compare_models(X_train, y_train, X_test, y_test):
     print("\n" + "="*70)
     print("MODEL COMPARISON SUMMARY")
     print("="*70)
-    print(f"\n{'Model':<20} {'Baseline R²':<15} {'NSI':<15} {'Retention %':<15}")
+    print(f"\n{'Model':<20} {'Baseline R²':<15} {'auc_norm':<15} {'Retention %':<15}")
     print("-"*70)
-    
+
     for name, result_dict in results.items():
         summary = result_dict['summary'].iloc[0]
         print(f"{name:<20} {summary['baseline_r2']:<15.4f} "
-              f"{summary['nsi_r2']:<15.4f} {summary['retention_pct_r2']:<15.2f}")
+              f"{summary['auc_norm_r2']:<15.4f} {summary['retention_pct_r2']:<15.2f}")
     
     print("="*70)
     
@@ -216,42 +214,43 @@ def compare_strategies(X_train, y_train, X_test, y_test, model=None):
     if model is None:
         model = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=1)
     
-    strategies = ['legacy', 'quantile', 'hetero', 'outlier', 'valprop']
+    # Every condition delivers the SAME amount of noise at a given level, so
+    # any difference below is a difference of shape, not of amount.
+    conditions = ['gaussian', 'student_t_nu5', 'laplace', 'outlier_p05']
+    label_sd = float(np.std(y_train))
     results = {}
-    
-    for strategy in strategies:
-        print(f"\n{strategy.upper()} strategy...")
-        
-        injector = NoiseInjectorRegression(strategy, random_state=42)
-        
-        # Calibrate
-        sigma = calibrate_sigma(y_train, 0.1, strategy=strategy, random_state=42)
-        print(f"  Calibrated σ = {sigma:.4f}")
-        
-        # Test
+
+    for condition in conditions:
+        print(f"\n{condition} ...")
+
+        # Test (>=4 noise levels so the Weibull fit is well-posed)
         predictions = {}
-        for mult in [0.0, 1.0, 2.0]:
-            s = sigma * mult
-            y_noisy = injector.inject(y_train, s) if mult > 0 else y_train
-            
+        for k in [0.0, 0.2, 0.5, 0.75, 1.0]:
+            s = k * label_sd
+            injector = NoiseInjectorRegression.from_condition(condition, random_state=42)
+            result = injector.inject_verbose(y_train, s)
+            y_noisy = result.y_noisy
+            if k:
+                print(f"  level {k}: asked {s:.4f}, delivered {result.delivered_dose:.4f}")
+
             model_copy = type(model)(**model.get_params())
             model_copy.fit(X_train, y_noisy)
             predictions[s] = model_copy.predict(X_test)
-        
+
         per_sigma, summary_df = calculate_noise_metrics(y_test, predictions)
-        results[strategy] = {'per_sigma': per_sigma, 'summary': summary_df}
-    
+        results[condition] = {'per_sigma': per_sigma, 'summary': summary_df}
+
     # Summary
     print("\n" + "="*70)
     print("STRATEGY COMPARISON")
     print("="*70)
-    print(f"\n{'Strategy':<15} {'Baseline R²':<15} {'NSI':<15} {'Retention %':<15}")
+    print(f"\n{'Condition':<16} {'Baseline R²':<15} {'auc_norm':<15} {'Retention %':<15}")
     print("-"*70)
-    
-    for strategy, result_dict in results.items():
+
+    for condition, result_dict in results.items():
         summary = result_dict['summary'].iloc[0]
-        print(f"{strategy:<15} {summary['baseline_r2']:<15.4f} "
-              f"{summary['nsi_r2']:<15.4f} {summary['retention_pct_r2']:<15.2f}")
+        print(f"{condition:<16} {summary['baseline_r2']:<15.4f} "
+              f"{summary['auc_norm_r2']:<15.4f} {summary['retention_pct_r2']:<15.2f}")
     
     print("="*70)
     

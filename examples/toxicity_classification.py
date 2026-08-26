@@ -159,25 +159,25 @@ def test_classification_robustness(X_train, y_train, X_test, y_test, strategy='u
     
     summary = summary_df.iloc[0]
     print(f"\nSummary Metrics:")
-    print(f"  Baseline Accuracy: {summary['baseline_accuracy']:.4f}")
-    print(f"  NSI (Accuracy):    {summary['nsi_accuracy']:.4f}")
-    print(f"  Retention:         {summary['retention_pct_accuracy']:.2f}%")
-    
-    print(f"\n  Baseline F1:       {summary['baseline_f1_macro']:.4f}")
-    print(f"  NSI (F1):          {summary['nsi_f1_macro']:.4f}")
-    print(f"  Retention (F1):    {summary['retention_pct_f1_macro']:.2f}%")
-    
+    print(f"  Baseline Accuracy:   {summary['baseline_accuracy']:.4f}")
+    print(f"  auc_norm (Accuracy): {summary['auc_norm_accuracy']:.4f}")
+    print(f"  Retention:           {summary['retention_pct_accuracy']:.2f}%")
+
+    print(f"\n  Baseline F1:         {summary['baseline_f1_macro']:.4f}")
+    print(f"  auc_norm (F1):       {summary['auc_norm_f1_macro']:.4f}")
+    print(f"  Retention (F1):      {summary['retention_pct_f1_macro']:.2f}%")
+
     # Per-class robustness
     print("\nPer-Class Robustness:")
     for cls in unique:
-        nsi_key = f'nsi_f1_class_{cls}'
+        auc_key = f'auc_norm_f1_class_{cls}'
         baseline_key = f'baseline_f1_class_{cls}'
         retention_key = f'retention_pct_f1_class_{cls}'
-        
-        if nsi_key in summary_df.columns:
+
+        if auc_key in summary_df.columns:
             print(f"  Class {cls}:")
             print(f"    Baseline F1: {summary[baseline_key]:.4f}")
-            print(f"    NSI:         {summary[nsi_key]:.4f}")
+            print(f"    auc_norm:    {summary[auc_key]:.4f}")
             print(f"    Retention:   {summary[retention_key]:.2f}%")
     
     return per_flip_df, summary_df, per_class_df
@@ -204,9 +204,9 @@ def compare_classification_strategies(X_train, y_train, X_test, y_test):
         )
         print(f"Calibrated flip_prob: {flip_prob:.4f}")
         
-        # Test at 3 levels
+        # Test at several levels (>=4 so the Weibull fit is well-posed)
         predictions = {}
-        for mult in [0.0, 1.0, 2.0]:
+        for mult in [0.0, 0.5, 1.0, 1.5, 2.0]:
             fp = flip_prob * mult
             y_noisy = y_train if mult == 0.0 else injector.inject(y_train, fp)
             
@@ -227,28 +227,28 @@ def compare_classification_strategies(X_train, y_train, X_test, y_test):
     print(f"\n{'='*70}")
     print("STRATEGY COMPARISON")
     print(f"{'='*70}")
-    print(f"\n{'Strategy':<20} {'Baseline Acc':<15} {'NSI':<15} {'Retention %':<15}")
+    print(f"\n{'Strategy':<20} {'Baseline Acc':<15} {'auc_norm':<15} {'Retention %':<15}")
     print("-" * 70)
-    
+
     for strategy, result_dict in results.items():
         summary = result_dict['summary'].iloc[0]
         print(f"{strategy:<20} {summary['baseline_accuracy']:<15.4f} "
-              f"{summary['nsi_accuracy']:<15.4f} {summary['retention_pct_accuracy']:<15.2f}")
-    
+              f"{summary['auc_norm_accuracy']:<15.4f} {summary['retention_pct_accuracy']:<15.2f}")
+
     print("=" * 70)
-    
-    # Most/least robust classes
+
+    # Most/least robust classes (ranked by auc_norm; higher = more robust)
     print("\nClass Robustness Analysis:")
     for strategy, result_dict in results.items():
         print(f"\n{strategy.upper()}:")
-        
+
         robust = get_most_robust_classes(result_dict['summary'], n=1)
         fragile = get_least_robust_classes(result_dict['summary'], n=1)
-        
+
         if robust:
-            print(f"  Most robust:  Class {robust[0][0]} (NSI={robust[0][1]:.4f})")
+            print(f"  Most robust:  Class {robust[0][0]} (auc_norm={robust[0][1]:.4f})")
         if fragile:
-            print(f"  Least robust: Class {fragile[0][0]} (NSI={fragile[0][1]:.4f})")
+            print(f"  Least robust: Class {fragile[0][0]} (auc_norm={fragile[0][1]:.4f})")
     
     return results
 

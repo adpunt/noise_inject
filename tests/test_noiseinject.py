@@ -12,7 +12,7 @@ import pytest
 from noiseInject import (
     NoiseInjectorRegression,
     NoiseInjectorClassification,
-    calibrate_sigma,
+    CONDITIONS,
     calibrate_flip_probability,
     calculate_noise_metrics,
     calculate_classification_metrics,
@@ -20,26 +20,283 @@ from noiseInject import (
 )
 
 
-# --- regression injection ---------------------------------------------------
+# --- regression injection: dose matching ------------------------------------
+#
+# The point of every test below is one property: at a given target, every
+# condition must deliver the SAME amount of noise. Six superseded strategies
+# delivered between 0.49x and 2.00x the same amount at one nominal setting, and
+# their entire apparent severity ordering was explained by that. See
+# NOISE_DESIGN.md sections 1, 2 and 2a.
+
+DOSE_MATCHED = [c for c, spec in CONDITIONS.items() if spec['strategy'] != 'censoring']
+CENSORING = [c for c, spec in CONDITIONS.items() if spec['strategy'] == 'censoring']
+
+
+def _labels(n=20000, seed=0):
+    """A skewed, strictly positive label column, like a real HOMO-LUMO gap."""
+    rng = np.random.RandomState(seed)
+    return np.abs(rng.normal(6.8, 1.29, n)) + 0.5
+
+
+def _groups(n=20000, n_groups=800, seed=1):
+    return np.random.RandomState(seed).randint(0, n_groups, n)
+
 
 def test_regression_inject_changes_values_and_preserves_shape():
-    y = np.linspace(-5, 5, 200)
-    inj = NoiseInjectorRegression('legacy', random_state=0)
-    y_noisy = inj.inject(y, sigma=1.0)
+    y = _labels(2000)
+    y_noisy = NoiseInjectorRegression.from_condition('gaussian', random_state=0).inject(y, 1.0)
     assert y_noisy.shape == y.shape
     assert not np.allclose(y_noisy, y)
 
 
 def test_regression_seed_is_reproducible():
-    y = np.linspace(-5, 5, 200)
-    a = NoiseInjectorRegression('legacy', random_state=42).inject(y, 1.0)
-    b = NoiseInjectorRegression('legacy', random_state=42).inject(y, 1.0)
-    assert np.allclose(a, b)
+    y = _labels(2000)
+    a = NoiseInjectorRegression.from_condition('gaussian', random_state=42).inject(y, 1.0)
+    b = NoiseInjectorRegression.from_condition('gaussian', random_state=42).inject(y, 1.0)
+    assert np.array_equal(a, b)
 
 
 def test_invalid_strategy_raises():
     with pytest.raises(ValueError):
-        NoiseInjectorRegression('not_a_strategy')
+        NoiseInjectorRegression(strategy='not_a_strategy')
+    with pytest.raises(ValueError):
+        NoiseInjectorRegression(distribution='not_a_distribution')
+    with pytest.raises(ValueError):
+        NoiseInjectorRegression.from_condition('legacy')      # deleted in 1.0.0
+
+
+@pytest.mark.parametrize('condition', DOSE_MATCHED)
+def test_dose_is_flat_across_conditions(condition):
+    """THE check. Every condition delivers the requested amount, not its own.
+
+    Tolerance follows NOISE_DESIGN.md section 5.1b: 0.5%, relaxed to 3% for
+    Student-t at nu = 3 where the fourth moment is infinite and the sample
+    statistic is unstable by construction, and for grouped-shifted whose group
+    term has few degrees of freedom (section 2a rule 3).
+    """
+    y, g = _labels(), _groups()
+    tau = 0.5 * y.std()
+    runs = [NoiseInjectorRegression.from_condition(condition, random_state=seed).inject_verbose(
+        y, tau, groups=g) for seed in range(20)]
+
+    # 1. The solved scale hits the target EXACTLY -- this part is arithmetic,
+    #    and it is the half of the gate that does not depend on a draw.
+    for r in runs:
+        assert r.unit_dose * r.solved_scale == pytest.approx(tau, rel=1e-12)
+
+    # 2. The MEAN realised dose hits it. A single realisation cannot: at
+    #    n = 20,000 the sampling spread of an RMS estimate is already 0.5%, and
+    #    for grouped-shifted the group term has only a few hundred degrees of
+    #    freedom. Section 2a rule 3 -- fix the population dose, record the
+    #    realised one.
+    mean_dose = float(np.mean([r.delivered_dose for r in runs]))
+    tol = 0.03 if condition in ('student_t_nu3', 'grouped_shifted') else 0.005
+    assert mean_dose == pytest.approx(tau, rel=tol), (
+        f"{condition}: asked for {tau:.4f}, delivered {mean_dose:.4f} on average")
+
+
+def test_zero_dose_records_exactly_zero():
+    """Not a small number -- zero. The negative control the old code never had.
+
+    The previous pipeline reconstructed the injected noise by regressing the
+    noisy label on the clean one; at zero noise the residuals were
+    floating-point rounding, whose size grows with the label -- which is exactly
+    where uncertainty is largest. The zero-noise control therefore showed a
+    STRONGER signal than the real levels did.
+    """
+    y, g = _labels(5000), _groups(5000)
+    for condition in DOSE_MATCHED:
+        r = NoiseInjectorRegression.from_condition(condition, random_state=0).inject_verbose(
+            y, 0.0, groups=g)
+        assert np.array_equal(r.epsilon, np.zeros(len(y))), condition
+        assert np.array_equal(r.y_noisy, y), condition
+
+
+@pytest.mark.parametrize('condition', DOSE_MATCHED + CENSORING)
+def test_recorded_noise_reconstructs_the_label_exactly(condition):
+    """y_clean + epsilon == y_noisy, bit for bit. Recorded, never reconstructed."""
+    y, g = _labels(5000), _groups(5000)
+    r = NoiseInjectorRegression.from_condition(condition, random_state=3).inject_verbose(
+        y, 0.4, groups=g)
+    assert np.array_equal(r.y_clean + r.epsilon, r.y_noisy)
+
+
+def test_student_t_reduces_to_gaussian_in_the_limit():
+    """Gaussian is Student-t's nu -> infinity limit, so the two must nest."""
+    y = _labels()
+    tau = 0.5 * y.std()
+    heavy = NoiseInjectorRegression(strategy='uniform', distribution='student_t',
+                                    nu=200.0, random_state=11).inject_verbose(y, tau)
+    normal = NoiseInjectorRegression.from_condition('gaussian',
+                                                    random_state=11).inject_verbose(y, tau)
+    assert heavy.unit_dose == pytest.approx(normal.unit_dose, abs=0.006)
+    frac = lambda r: np.mean(np.abs(r.epsilon) > 3 * tau)
+    assert frac(heavy) == pytest.approx(frac(normal), abs=0.002)
+
+
+def test_student_t_rejects_undefined_variance():
+    """At nu <= 2 the variance is undefined and dose matching stops meaning anything."""
+    for nu in (2.0, 1.5, 0.5):
+        with pytest.raises(ValueError):
+            NoiseInjectorRegression(strategy='uniform', distribution='student_t', nu=nu)
+    with pytest.raises(ValueError):
+        NoiseInjectorRegression(strategy='uniform', distribution='student_t')
+
+
+def test_conditions_are_distinguishable_at_matched_dose():
+    """Matched amount must not mean matched shape, or there is nothing to compare.
+
+    NOISE_DESIGN.md section 5.2 measured an eight-fold spread in how many labels
+    end up badly wrong at identical total noise.
+    """
+    y, g = _labels(), _groups()
+    tau = 0.5 * y.std()
+    frac = {}
+    for condition in ('gaussian', 'student_t_nu5', 'student_t_nu3', 'grouped_wider',
+                      'outlier_p10'):
+        r = NoiseInjectorRegression.from_condition(condition, random_state=5).inject_verbose(
+            y, tau, groups=g)
+        frac[condition] = float(np.mean(np.abs(r.epsilon) > 3 * tau))
+    assert frac['gaussian'] < 0.005
+    assert frac['student_t_nu3'] > 3 * frac['gaussian']
+    assert frac['grouped_wider'] > 3 * frac['gaussian']
+
+
+# --- the two grouped conditions ---------------------------------------------
+
+def test_grouped_requires_a_group_assignment():
+    y = _labels(1000)
+    for condition in ('grouped_wider', 'grouped_shifted'):
+        with pytest.raises(ValueError):
+            NoiseInjectorRegression.from_condition(condition, random_state=0).inject_verbose(y, 0.3)
+
+
+def test_grouped_wider_records_the_realised_molecule_fraction():
+    """Selection is by molecule fraction, not group fraction (section 2a rule 1).
+
+    Real Murcko scaffolds are very unevenly sized: on QM9 a nominal group
+    fraction of 0.2 delivered an affected molecule fraction anywhere between
+    0.067 and 0.551. Whatever is realised must be recorded, because the
+    solver divides by it.
+    """
+    y = _labels()
+    # Deliberately lopsided groups, like real scaffolds: one holds a third.
+    groups = np.concatenate([np.zeros(len(y) // 3, dtype=int),
+                             np.arange(len(y) - len(y) // 3) + 1])
+    r = NoiseInjectorRegression.from_condition('grouped_wider', random_state=0).inject_verbose(
+        y, 0.5, groups=groups)
+    assert 0.15 <= r.affected_molecule_fraction <= 0.40
+    assert r.n_groups == len(np.unique(groups))
+    assert r.largest_group_share == pytest.approx(1 / 3, abs=0.01)
+    # Only the affected molecules get the wider scale, and it is lambda times wider.
+    scales = np.unique(np.round(r.noise_scale, 10))
+    assert len(scales) == 2
+    assert scales[1] / scales[0] == pytest.approx(3.0, rel=1e-6)
+
+
+def test_grouped_shifted_moves_whole_groups_together():
+    """Every molecule in a group shares one offset -- that is the mechanism.
+
+    Not zero-mean in any one run, and the offsets are deliberately not centred.
+    """
+    y = _labels(6000)
+    groups = np.repeat(np.arange(60), 100)
+    r = NoiseInjectorRegression.from_condition('grouped_shifted', random_state=2).inject_verbose(
+        y, 0.5, groups=groups)
+    per_group = np.array([r.epsilon[groups == g].mean() for g in range(60)])
+    flat = NoiseInjectorRegression.from_condition('gaussian', random_state=2).inject_verbose(
+        y, 0.5)
+    per_group_flat = np.array([flat.epsilon[groups == g].mean() for g in range(60)])
+    # rho = 0.62 of the variance sits between groups, so group means must be
+    # far more spread out than they would be under any ungrouped condition.
+    assert per_group.std() > 5 * per_group_flat.std()
+    assert per_group.std() == pytest.approx(np.sqrt(0.62) * 0.5, rel=0.25)
+
+
+# --- censoring ---------------------------------------------------------------
+
+def test_only_censoring_and_grouped_shifted_move_labels_off_centre():
+    """Scatter versus bias -- the comparison the whole study now turns on.
+
+    Models can average away unbiased scatter but not a systematic shift, which
+    is why censoring costs twelve times more than any difference between the
+    zero-mean shapes. Grouped-shifted is the second, independent demonstration
+    of the same effect at the level of a chemical family, so it is biased per
+    run BY DESIGN and does not belong with the scatter conditions.
+    """
+    y, g = _labels(), _groups()
+    tau = 0.5 * y.std()
+    zero_mean = [c for c in DOSE_MATCHED if c != 'grouped_shifted']
+    scatter = [abs(NoiseInjectorRegression.from_condition(c, random_state=4).inject_verbose(
+        y, tau, groups=g).mean_shift) for c in zero_mean]
+    shifted = NoiseInjectorRegression.from_condition(
+        'grouped_shifted', random_state=4).inject_verbose(y, tau, groups=g)
+    cens = NoiseInjectorRegression.from_condition('censoring_25', random_state=4).inject_verbose(
+        y, tau, groups=g)
+
+    assert max(scatter) < 0.02 * tau                 # the five scatter conditions stay centred
+    assert abs(shifted.mean_shift) > 5 * max(scatter)
+    assert abs(cens.mean_shift) > 10 * max(scatter)
+    assert cens.mean_shift < 0                       # an upper limit lowers labels
+
+
+def test_censoring_clips_the_requested_fraction_and_nothing_else():
+    y = _labels()
+    r = NoiseInjectorRegression.from_condition('censoring_30', random_state=0).inject_verbose(y, 0.0)
+    assert r.affected_molecule_fraction == pytest.approx(0.30, abs=0.005)
+    assert np.all(r.y_noisy <= r.censoring_limit + 1e-9)
+    untouched = r.epsilon == 0
+    assert np.all(r.y_noisy[untouched] == y[untouched])
+    assert np.isnan(r.unit_dose) and np.isnan(r.target_dose)   # not dose-matched
+
+
+def test_censoring_scores_held_out_molecules_against_the_training_limit():
+    """The cut-point comes from the TRAINING labels, or held-out molecules are
+    scored against a distribution they were never exposed to."""
+    y_train, y_test = _labels(8000, seed=0), _labels(4000, seed=99) + 2.0
+    inj = NoiseInjectorRegression.from_condition('censoring_20', random_state=0)
+    scale_own = inj.noise_scale(y_test, 0.0)
+    scale_ref = inj.noise_scale(y_test, 0.0, reference=y_train)
+    assert not np.allclose(scale_own, scale_ref)
+    assert (scale_ref > 0).mean() > (scale_own > 0).mean()
+
+
+# --- the provenance every row must carry -------------------------------------
+
+def test_every_provenance_field_is_populated():
+    """A blank provenance column is how the dose confound survived for years."""
+    y, g = _labels(4000), _groups(4000)
+    for condition in DOSE_MATCHED + CENSORING:
+        row = NoiseInjectorRegression.from_condition(condition, random_state=8).inject_verbose(
+            y, 0.4, groups=g).as_row()
+        for key in ('condition', 'strategy', 'distribution', 'delivered_dose',
+                    'delivered_dose_fraction_of_sd', 'affected_molecule_fraction',
+                    'mean_shift', 'n_groups', 'largest_group_share', 'seed'):
+            assert row[key] is not None, f"{condition}: {key} is blank"
+        assert row['condition'] == condition
+
+
+def test_shape_only_conditions_declare_their_scale_degenerate():
+    """For Gaussian/Student-t/Laplace every molecule gets the same scale, so
+    "which region is unreliable" is UNDEFINED, not zero. Say so, loudly."""
+    y, g = _labels(3000), _groups(3000)
+    flat = NoiseInjectorRegression.from_condition('gaussian', random_state=0).inject_verbose(y, 0.4)
+    assert flat.scale_is_degenerate
+    assert len(np.unique(flat.noise_scale)) == 1
+    structured = NoiseInjectorRegression.from_condition(
+        'grouped_wider', random_state=0).inject_verbose(y, 0.4, groups=g)
+    assert not structured.scale_is_degenerate
+    assert len(np.unique(structured.noise_scale)) > 1
+
+
+def test_effective_noise_measures_the_second_moment():
+    """The default was mean |dy|, the first moment. Matching it hands the
+    heavy-tailed conditions up to 24% more actual noise at one setting."""
+    y = _labels()
+    inj = NoiseInjectorRegression.from_condition('gaussian', random_state=0)
+    r = inj.inject_verbose(y, 0.4)
+    assert inj.get_effective_noise(y, r.y_noisy, method='rms') == pytest.approx(0.4, rel=0.01)
+    assert inj.get_effective_noise(y, r.y_noisy) == pytest.approx(0.4 / y.std(), rel=0.01)
 
 
 # --- classification injection ----------------------------------------------
@@ -63,14 +320,14 @@ def test_binary_asymmetric_actually_flips():
 
 
 # --- calibration ------------------------------------------------------------
+# Regression has none: every condition solves for its own scale in closed form.
+# `calibrate_sigma` was deleted in 1.0.0 -- it searched on the FIRST moment.
 
-def test_calibrate_sigma_hits_target_effective_noise():
-    rng = np.random.RandomState(0)
-    y = rng.normal(0, 1, 1000)
-    sigma = calibrate_sigma(y, target_effective_noise=0.1, random_state=0)
-    inj = NoiseInjectorRegression('legacy', random_state=0)
-    eff = inj.get_effective_noise(y, inj.inject(y, sigma))
-    assert abs(eff - 0.1) < 0.03
+def test_calibrate_flip_probability_hits_target_flip_rate():
+    y = np.array([0, 1] * 500)
+    p = calibrate_flip_probability(y, target_flip_rate=0.2, random_state=0)
+    inj = NoiseInjectorClassification('uniform', random_state=0)
+    assert abs(inj.get_effective_flip_rate(y, inj.inject(y, p)) - 0.2) < 0.05
 
 
 # --- metrics ----------------------------------------------------------------
@@ -81,8 +338,13 @@ def test_regression_metrics_return_expected_columns():
     predictions = {0.0: y_true.copy(), 1.0: y_true + rng.normal(0, 0.5, 100)}
     per_sigma, summary = calculate_noise_metrics(y_true, predictions)
     assert 'r2' in per_sigma.columns
-    assert 'nsi_r2' in summary.columns
+    # auc_norm / Weibull replace the old NSI slope; Weibull column is present even with
+    # <4 sigma points (value is NaN, see the >=4-point test below).
+    assert 'auc_norm_r2' in summary.columns
+    assert 'weibull_beta_r2' in summary.columns
+    assert 'curve_stable_r2' in summary.columns
     assert 'retention_pct_r2' in summary.columns
+    assert not any(c.startswith('nsi_') for c in summary.columns)
 
 
 def test_classification_metrics_return_three_frames():
@@ -91,8 +353,73 @@ def test_classification_metrics_return_three_frames():
     predictions = {0.0: y_true.copy(), 0.2: rng.permutation(y_true)}
     per_flip, summary, per_class = calculate_classification_metrics(y_true, predictions)
     assert 'accuracy' in per_flip.columns
-    assert 'nsi_accuracy' in summary.columns
+    assert 'auc_norm_accuracy' in summary.columns
+    assert 'auc_norm_f1_class_0' in summary.columns
     assert 'class' in per_class.columns
+    assert not any(c.startswith('nsi_') for c in summary.columns)
+
+
+def test_auc_norm_flat_curve_is_one_and_stable():
+    """A perfectly flat R2 curve retains 100% of skill: auc_norm == 1, curve marked stable."""
+    y_true = np.linspace(-3, 3, 200)
+    predictions = {s: y_true + 0.5 * np.sin(y_true) for s in (0.0, 0.25, 0.5, 0.75, 1.0)}
+    _, summary = calculate_noise_metrics(y_true, predictions)
+    assert abs(summary['auc_norm_r2'].iloc[0] - 1.0) < 1e-9
+    assert summary['curve_stable_r2'].iloc[0] is True or summary['curve_stable_r2'].iloc[0] == True  # noqa: E712
+
+
+def test_auc_norm_matches_reference_formula():
+    """auc_norm / weibull_beta equal the standalone reference helpers on a hand-built curve."""
+    from noiseInject.metrics import _retention_auc_norm, _retention_weibull
+
+    sig = np.array([0.0, 0.25, 0.5, 0.75, 1.0])
+    r2 = np.array([0.90, 0.88, 0.82, 0.70, 0.50])
+    # Build predictions that reproduce exactly this r2 curve on a fixed y_true.
+    rng = np.random.RandomState(7)
+    y_true = rng.normal(0, 1, 4000)
+    var = np.var(y_true)
+    predictions = {}
+    for s, target in zip(sig, r2):
+        # r2 = 1 - MSE/var  ->  MSE = (1-r2)*var ; add zero-mean noise of that variance
+        noise = rng.normal(0, np.sqrt((1 - target) * var), y_true.size)
+        predictions[float(s)] = y_true + noise
+    per_sigma, summary = calculate_noise_metrics(y_true, predictions)
+    obs_r2 = per_sigma.sort_values('sigma')['r2'].values
+    base = obs_r2[0]
+    exp_auc = _retention_auc_norm(sig, obs_r2, base)
+    exp_tau, exp_beta = _retention_weibull(sig, obs_r2, base)
+    assert abs(summary['auc_norm_r2'].iloc[0] - exp_auc) < 1e-9
+    assert abs(summary['weibull_beta_r2'].iloc[0] - exp_beta) < 1e-6
+
+
+def test_curve_stable_false_on_negative_retention():
+    """A retrain that collapses to negative R2 leaves auc_norm finite but flags instability."""
+    rng = np.random.RandomState(1)
+    y_true = rng.normal(0, 1, 300)
+    predictions = {
+        0.0: y_true.copy(),
+        0.25: y_true + rng.normal(0, 0.3, 300),
+        0.5: y_true[::-1] * 5.0,          # anti-correlated blow-up -> R2 << 0
+        0.75: y_true + rng.normal(0, 0.6, 300),
+        1.0: y_true + rng.normal(0, 0.8, 300),
+    }
+    _, summary = calculate_noise_metrics(y_true, predictions)
+    assert summary['curve_stable_r2'].iloc[0] == False  # noqa: E712
+    assert np.isfinite(summary['auc_norm_r2'].iloc[0])   # value still reported, not masked
+
+
+def test_baseline_threshold_gates_weak_models():
+    """With baseline_threshold set above the clean R2, curve scalars are NaN; default keeps them."""
+    rng = np.random.RandomState(2)
+    y_true = rng.normal(0, 1, 300)
+    predictions = {s: y_true + rng.normal(0, 0.4 + s, 300) for s in (0.0, 0.25, 0.5, 0.75, 1.0)}
+
+    _, summary_default = calculate_noise_metrics(y_true, predictions)
+    assert np.isfinite(summary_default['auc_norm_r2'].iloc[0])  # default: no gating
+
+    _, summary_gated = calculate_noise_metrics(y_true, predictions, baseline_threshold=0.99)
+    assert np.isnan(summary_gated['auc_norm_r2'].iloc[0])
+    assert np.isnan(summary_gated['weibull_beta_r2'].iloc[0])
 
 
 # --- uncertainty metrics ----------------------------------------------------

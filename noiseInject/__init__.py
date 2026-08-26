@@ -6,13 +6,15 @@ Supports both regression (continuous noise) and classification (label flips)
 from .core import (
     NoiseInjectorRegression,
     NoiseInjectorClassification,
+    InjectionResult,
+    CONDITIONS,
+    REGRESSION_STRATEGIES,
+    REGRESSION_DISTRIBUTIONS,
 )
 
 from .calibration import (
-    # Regression calibration
-    calibrate_sigma,
-    calibrate_multiple_sigmas,
-    # Classification calibration
+    # Classification calibration. Regression needs none: every condition
+    # solves for its own scale in closed form -- see NOISE_DESIGN.md section 1.
     calibrate_flip_probability,
     calibrate_multiple_flip_probabilities
 )
@@ -29,16 +31,17 @@ from .metrics import (
 
 from .uncertainty import calculate_uncertainty_metrics
 
-__version__ = '0.3.0'
+__version__ = '1.0.0'
 
 __all__ = [
     # Core classes
     'NoiseInjectorRegression',
     'NoiseInjectorClassification',
-    'NoiseInjector',
-    # Regression calibration
-    'calibrate_sigma',
-    'calibrate_multiple_sigmas',
+    'InjectionResult',
+    # The condition registry
+    'CONDITIONS',
+    'REGRESSION_STRATEGIES',
+    'REGRESSION_DISTRIBUTIONS',
     # Classification calibration
     'calibrate_flip_probability',
     'calibrate_multiple_flip_probabilities',

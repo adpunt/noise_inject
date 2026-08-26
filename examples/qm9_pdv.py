@@ -19,7 +19,7 @@ from torch_geometric.datasets import QM9
 import torch
 import os.path as osp
 
-from noiseInject import NoiseInjectorRegression, calculate_noise_metrics, calibrate_sigma
+from noiseInject import NoiseInjectorRegression, calculate_noise_metrics
 
 # Disable multiprocessing to avoid segfaults
 torch.set_num_threads(1)
@@ -173,45 +173,47 @@ def load_qm9_with_pdv(target_property='homo_lumo_gap', sample_size=5000, random_
 # ============================================================================
 
 def test_noise_robustness(X_train, y_train, X_test, y_test, 
-                         strategy='legacy', model_name='XGBoost'):
+                         condition='gaussian', model_name='XGBoost'):
     """
     Test model robustness to label noise using NoiseInject.
     
     Args:
         X_train, y_train: Training data
         X_test, y_test: Test data (clean labels)
-        strategy: Noise strategy to use
+        condition: Noise condition to use, e.g. 'gaussian', 'student_t_nu5',
+                   'censoring_25' -- see noiseInject.CONDITIONS
         model_name: Name for display
     
     Returns:
         metrics_df: DataFrame with robustness metrics
     """
     print(f"\n{'='*70}")
-    print(f"Testing {model_name} with {strategy.upper()} noise strategy")
+    print(f"Testing {model_name} under {condition} noise")
     print(f"{'='*70}")
-    
-    # Step 1: Calibrate sigma for fair comparison
-    print("\n1. Calibrating sigma for 10% effective noise...")
-    injector = NoiseInjectorRegression(strategy=strategy, random_state=42)
-    sigma_cal = calibrate_sigma(y_train, target_effective_noise=0.1, 
-                                strategy=strategy, random_state=42)
-    print(f"   Calibrated sigma: {sigma_cal:.4f}")
-    
+
+    # Step 1: nothing to calibrate. The level IS the amount delivered, as a
+    # fraction of the label spread, and every condition solves for the scale
+    # that delivers it.
+    label_sd = float(np.std(y_train))
+    print(f"\n1. Label spread: {label_sd:.4f}")
+
     # Step 2: Test at multiple noise levels
     print("\n2. Testing at multiple noise levels...")
-    sigma_levels = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]  # Higher multipliers to see degradation
-    
+    levels = [0.0, 0.2, 0.3, 0.5, 0.75, 1.0]   # fractions of the label spread
+
     predictions = {}
-    
-    for mult in sigma_levels:
-        sigma = sigma_cal * mult
-        print(f"   Testing sigma = {sigma:.4f} (mult = {mult})...")
-        
-        # Inject noise (or use clean labels for baseline)
-        if mult == 0.0:
-            y_train_noisy = y_train
-        else:
-            y_train_noisy = injector.inject(y_train, sigma)
+
+    for k in levels:
+        sigma = k * label_sd
+        print(f"   Testing level {k} -> dose {sigma:.4f} ...")
+
+        # Inject noise. A fresh injector per call keeps the draw reproducible.
+        injector = NoiseInjectorRegression.from_condition(condition, random_state=42)
+        result = injector.inject_verbose(y_train, sigma)
+        y_train_noisy = result.y_noisy
+        if k:
+            print(f"      delivered {result.delivered_dose:.4f}"
+                  f" ({result.delivered_dose_fraction_of_sd:.3f} of the spread)")
         
         # Train model
         from xgboost import XGBRegressor
@@ -236,7 +238,8 @@ def test_noise_robustness(X_train, y_train, X_test, y_test,
     print("\nSummary statistics:")
     summary = summary_df.iloc[0]
     print(f"  Baseline R²:     {summary['baseline_r2']:.4f}")
-    print(f"  NSI (R²):        {summary['nsi_r2']:.4f} (p={summary['nsi_r2_pval']:.4f})")
+    print(f"  auc_norm (R²):   {summary['auc_norm_r2']:.4f}")
+    print(f"  Weibull β:       {summary['weibull_beta_r2']:.2f}")
     print(f"  Retention:       {summary['retention_pct_r2']:.2f}%")
     
     return per_sigma_df, summary_df
@@ -244,39 +247,39 @@ def test_noise_robustness(X_train, y_train, X_test, y_test,
 
 def compare_strategies(X_train, y_train, X_test, y_test):
     """
-    Compare multiple noise strategies.
+    Compare multiple noise conditions at matched dose.
     
     Args:
         X_train, y_train: Training data
         X_test, y_test: Test data
     
     Returns:
-        results: Dictionary of results for each strategy
+        results: Dictionary of results for each condition
     """
-    strategies = ['legacy', 'quantile', 'hetero', 'outlier']
+    conditions = ['gaussian', 'student_t_nu5', 'laplace', 'outlier_p05']
     results = {}
     
-    for strategy in strategies:
+    for condition in conditions:
         per_sigma_df, summary_df = test_noise_robustness(
             X_train, y_train, X_test, y_test,
-            strategy=strategy
+            condition=condition
         )
-        results[strategy] = {'per_sigma': per_sigma_df, 'summary': summary_df}
+        results[condition] = {'per_sigma': per_sigma_df, 'summary': summary_df}
     
     # Print comparison
     print(f"\n{'='*70}")
     print("STRATEGY COMPARISON")
     print(f"{'='*70}")
-    print(f"\n{'Strategy':<15} {'Baseline R²':<15} {'NSI (R²)':<15} {'Retention %':<15}")
+    print(f"\n{'Strategy':<15} {'Baseline R²':<15} {'auc_norm':<15} {'Retention %':<15}")
     print("-" * 70)
-    
-    for strategy, result_dict in results.items():
+
+    for condition, result_dict in results.items():
         summary = result_dict['summary'].iloc[0]
         baseline_r2 = summary['baseline_r2']
-        nsi_r2 = summary['nsi_r2']
+        auc_norm_r2 = summary['auc_norm_r2']
         retention = summary['retention_pct_r2']
-        
-        print(f"{strategy:<15} {baseline_r2:<15.4f} {nsi_r2:<15.4f} {retention:<15.2f}")
+
+        print(f"{condition:<15} {baseline_r2:<15.4f} {auc_norm_r2:<15.4f} {retention:<15.2f}")
     
     return results
 
@@ -308,14 +311,14 @@ def main():
     print(f"Train size: {len(X_train)}")
     print(f"Test size: {len(X_test)}")
     
-    # Step 3: Test single strategy in detail
+    # Step 3: Test a single condition in detail
     print("\n" + "="*70)
     print("DETAILED ANALYSIS - LEGACY STRATEGY")
     print("="*70)
     
     per_sigma_df, summary_df = test_noise_robustness(
         X_train, y_train, X_test, y_test,
-        strategy='legacy'
+        condition='gaussian'
     )
     
     # Already printed in function, no need to print again
@@ -334,10 +337,10 @@ def main():
     import os
     os.makedirs('results', exist_ok=True)
     
-    for strategy, result_dict in results.items():
-        result_dict['per_sigma'].to_csv(f"results/qm9_pdv_{strategy}_per_sigma.csv", index=False)
-        result_dict['summary'].to_csv(f"results/qm9_pdv_{strategy}_summary.csv", index=False)
-        print(f"  Saved {strategy} results to results/")
+    for condition, result_dict in results.items():
+        result_dict['per_sigma'].to_csv(f"results/qm9_pdv_{condition}_per_sigma.csv", index=False)
+        result_dict['summary'].to_csv(f"results/qm9_pdv_{condition}_summary.csv", index=False)
+        print(f"  Saved {condition} results to results/")
     
     print("\n" + "="*70)
     print("WORKFLOW COMPLETE")
