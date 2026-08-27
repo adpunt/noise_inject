@@ -111,6 +111,17 @@ def dose_tolerance(epsilon, effective_n, nu=None):
     return max(3.0 * se, 0.005)
 
 
+class DoseError(RuntimeError):
+    """The injector delivered an amount it was not asked for.
+
+    Its own class, and not a plain RuntimeError, for one reason: callers wrap
+    model fits in `except Exception` and carry on, which is right for a model
+    that failed to fit and wrong for this. A run that quietly drops the cells
+    where the injection missed finishes green having measured something other
+    than what it reports. KIRBy re-raises this alongside `RunIntegrityError`.
+    """
+
+
 class InjectionResult:
     """Everything one injection produced, including its provenance.
 
@@ -567,7 +578,7 @@ class NoiseInjectorRegression:
         tol = dose_tolerance(epsilon, effective_n,
                              nu=params.get('nu', self.params.get('nu')))
         if abs(realised / dose - 1.0) > tol:
-            raise RuntimeError(
+            raise DoseError(
                 f"{self.condition} delivered {realised:.6f} against a target of "
                 f"{dose:.6f} ({100 * (realised / dose - 1.0):+.2f}%), outside the "
                 f"{100 * tol:.2f}% band that {effective_n:.0f} effective "

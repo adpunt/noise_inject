@@ -96,6 +96,22 @@ Shape and targeting are chosen separately.
 record and the provenance — unit dose, solved scale, delivered dose, affected fraction —
 so no downstream figure is ever untraceable to the amount of noise that produced it.
 
+It also **checks** the delivered amount rather than only recording it, and raises
+`DoseError` when a draw lands outside the band `dose_tolerance` allows for that
+condition. The band is three standard errors derived from the draw's own fourth
+moment and its effective size, so a heavy tail and a group-level term widen it on
+their own. Two consequences worth knowing before you catch it:
+
+- `DoseError` subclasses `RuntimeError`, but it has its own class on purpose. Callers
+  that wrap work in `except Exception` and carry on will otherwise turn a wrong
+  injection into a missing result rather than a failure. Re-raise it.
+- Three legitimate draws in a thousand fall outside a three-sigma band by chance. On
+  a few hundred records with a heavy tail that rate is higher, so on small datasets
+  decide deliberately whether a missed draw should stop the run.
+
+Censoring is exempt: it is swept on the fraction of labels clipped and has no target
+amount to check against.
+
 ### Classification (label flips)
 - **uniform**: Equal flip probability for all
 - **class_imbalance**: Varies by class frequency

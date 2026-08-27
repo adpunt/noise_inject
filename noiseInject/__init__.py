@@ -8,6 +8,7 @@ from .core import (
     NoiseInjectorClassification,
     InjectionResult,
     dose_tolerance,
+    DoseError,
     CONDITIONS,
     REGRESSION_STRATEGIES,
     REGRESSION_DISTRIBUTIONS,
@@ -40,6 +41,7 @@ __all__ = [
     'NoiseInjectorClassification',
     'InjectionResult',
     'dose_tolerance',
+    'DoseError',
     # The condition registry
     'CONDITIONS',
     'REGRESSION_STRATEGIES',
