@@ -202,12 +202,16 @@ class NoiseInjectorRegression:
     """
 
     def __init__(self, strategy: str = 'uniform', distribution: str = 'gaussian',
-                 random_state: Optional[int] = None, **params):
+                 random_state: Optional[int] = None,
+                 selection_state: Optional[int] = None, **params):
         """
         Args:
             strategy: one of REGRESSION_STRATEGIES
             distribution: one of REGRESSION_DISTRIBUTIONS
-            random_state: seed
+            random_state: seed for the SHAPE draws
+            selection_state: seed for WHO GETS HIT. Defaults to random_state.
+                Pin it when random_state varies per noise level, so the affected
+                molecules stay the same across the level grid.
             **params: condition parameters (nu, lam, group_fraction, rho, p,
                       censored_fraction, side). May also be supplied per call.
         """
@@ -229,11 +233,13 @@ class NoiseInjectorRegression:
         self.distribution = distribution
         self.params = dict(params)
         self.random_state = random_state
+        self.selection_state = selection_state
         self.rng = np.random.RandomState(random_state)
 
     # ------------------------------------------------------------------
     @classmethod
-    def from_condition(cls, condition: str, random_state: Optional[int] = None):
+    def from_condition(cls, condition: str, random_state: Optional[int] = None,
+                       selection_state: Optional[int] = None):
         """Build from a registry name, e.g. 'student_t_nu5' or 'censoring_25'."""
         if condition not in CONDITIONS:
             raise ValueError(f"unknown condition {condition!r}; known: {sorted(CONDITIONS)}")
@@ -241,7 +247,8 @@ class NoiseInjectorRegression:
         strategy = spec.pop('strategy')
         distribution = spec.pop('distribution')
         inj = cls(strategy=strategy, distribution=distribution,
-                  random_state=random_state, **spec)
+                  random_state=random_state, selection_state=selection_state,
+                  **spec)
         inj.condition = condition
         return inj
 
@@ -313,14 +320,25 @@ class NoiseInjectorRegression:
     def _selection_rng(self) -> np.random.RandomState:
         """A generator for WHO gets hit, separate from the shape draws.
 
-        It is re-seeded from `random_state` on every call, so the scale map is a
-        deterministic function of (seed, groups, parameters) and does not depend
-        on how many shape draws have happened. That is what the confound control
-        needs: the *pattern* of unreliability must be the same column at every
-        noise level, including zero, or the zero-noise subtraction is comparing
-        two different patterns rather than isolating the effect of the noise.
+        It is re-seeded on every call, so the scale map is a deterministic
+        function of (seed, groups, parameters) and does not depend on how many
+        shape draws have happened. That is what the confound control needs: the
+        *pattern* of unreliability must be the same column at every noise level,
+        including zero, or the zero-noise subtraction is comparing two different
+        patterns rather than isolating the effect of the noise.
+
+        `selection_state` is that seed when it is set, and `random_state` when it
+        is not. A caller that varies `random_state` per LEVEL -- so each level
+        draws its own shape -- must pin `selection_state` to something that does
+        NOT vary with the level, or the affected molecules change from level to
+        level and the pattern column describes an injection that never happened.
+        Measured on a 120-molecule fixture before this existed: for outlier_p10
+        the pattern and the realised scale had Spearman -0.10, and their top-15%
+        sets overlapped 3 of 18.
         """
-        seed = self.random_state
+        seed = getattr(self, 'selection_state', None)
+        if seed is None:
+            seed = self.random_state
         if seed is None:
             return np.random.RandomState()
         return np.random.RandomState((int(seed) ^ 0x5CA1E) & 0xFFFFFFFF)
