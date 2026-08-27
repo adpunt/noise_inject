@@ -9,6 +9,7 @@ from .core import (
     InjectionResult,
     dose_tolerance,
     DoseError,
+    DoseWarning,
     CONDITIONS,
     REGRESSION_STRATEGIES,
     REGRESSION_DISTRIBUTIONS,
@@ -42,6 +43,7 @@ __all__ = [
     'InjectionResult',
     'dose_tolerance',
     'DoseError',
+    'DoseWarning',
     # The condition registry
     'CONDITIONS',
     'REGRESSION_STRATEGIES',

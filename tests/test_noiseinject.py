@@ -7,6 +7,7 @@ Covers the core injection/calibration/metrics paths plus a regression test for t
 """
 
 import sys
+import warnings
 
 import numpy as np
 import pytest
@@ -16,6 +17,7 @@ from noiseInject import (
     NoiseInjectorClassification,
     CONDITIONS,
     dose_tolerance,
+    DoseWarning,
     calibrate_flip_probability,
     calculate_noise_metrics,
     calculate_classification_metrics,
@@ -143,24 +145,40 @@ def test_dose_is_flat_across_conditions(case):
 
 
 def test_the_delivered_dose_is_checked_not_just_recorded():
-    """The injector must REFUSE to hand back an amount it was not asked for.
+    """The injector must SAY SO when it hands back an amount it was not asked for.
 
     Every field of the provenance was written and nothing ever read it back, so
     grouped-shifted delivered up to 1.51x its target under a heavy tail for the
-    life of the project without a single check going red. The Rust injector has
-    aborted on this since it was written; this is its Python twin.
+    life of the project without a single check going red.
+
+    It warns rather than raising. The band is three standard errors, so a working
+    injector trips it by chance on about 1% of draws at the sizes the
+    experimental datasets have, and stopping there would discard a sound run over
+    an unlucky draw. What must not happen is silence.
 
     The draw is scaled behind the injector's back, which is the only way to
-    produce a wrong amount once the code is right -- the point is that the
-    guard exists and fires, not that any condition still miscalibrates.
+    produce a wrong amount once the code is right -- the point is that the check
+    exists and fires, not that any condition still miscalibrates.
     """
     y, g = _labels(5000), _groups(5000)
     for condition in DOSE_MATCHED:
         inj = NoiseInjectorRegression.from_condition(condition, random_state=0)
         honest = inj._draw_shape
         inj._draw_shape = lambda n, _f=honest, **kw: 2.0 * _f(n, **kw)
-        with pytest.raises(RuntimeError, match='outside the'):
-            inj.inject_verbose(y, 0.4, groups=g)
+        with pytest.warns(DoseWarning, match='outside the'):
+            r = inj.inject_verbose(y, 0.4, groups=g)
+        # And it carries on, with the amount it really delivered on the row.
+        assert r.as_row()['realised_dose_label_units'] > 0.6, condition
+
+
+def test_a_draw_that_lands_inside_the_band_is_silent():
+    """No warning on an ordinary draw, or the real one is lost in the noise."""
+    y, g = _labels(), _groups()
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', DoseWarning)
+        for condition in DOSE_MATCHED:
+            NoiseInjectorRegression.from_condition(
+                condition, random_state=0).inject_verbose(y, 0.5 * y.std(), groups=g)
 
 
 def test_censoring_is_exempt_from_the_dose_check():
