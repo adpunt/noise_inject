@@ -252,18 +252,48 @@ class NoiseInjectorRegression:
         inj.condition = condition
         return inj
 
+    def _shape_name(self) -> str:
+        """The shape's name. Matches `NoiseShape::name` in `rust/src/main.rs`."""
+        if self.distribution == 'student_t':
+            nu = self.params.get('nu')
+            return 'student_t' if nu is None else f"student_t_nu{float(nu):g}"
+        return self.distribution
+
     @property
     def condition(self) -> str:
-        """The registry name for this configuration, if it has one."""
+        """This configuration's name, composed the way the QM9 injector composes it.
+
+        One rule, not a lookup against the registry. `condition_name` in
+        `qsar_qm_models/rust/src/main.rs` builds the name from the targeting,
+        the contaminated fraction where there is one, and the shape; results
+        rows from the two pipelines are joined on this string, so a second rule
+        here means they cannot be joined.
+
+        The previous fallback returned `outlier/laplace` for anything the
+        registry did not list. QM9 writes `outlier_p05_laplace` for the same
+        configuration, and worse, `outlier/laplace` is ALSO what 1% and 10%
+        contamination came out as: the fraction is in no results column, so
+        dropping it from the name loses it from the results entirely.
+
+        Every registry name comes out of this rule unchanged, which
+        `test_condition_names_match_the_registry` asserts.
+        """
         if getattr(self, '_condition', None):
             return self._condition
-        for name, spec in CONDITIONS.items():
-            if spec['strategy'] != self.strategy or spec['distribution'] != self.distribution:
-                continue
-            rest = {k: v for k, v in spec.items() if k not in ('strategy', 'distribution')}
-            if all(float(self.params.get(k, float('nan'))) == float(v) for k, v in rest.items()):
-                return name
-        return f"{self.strategy}/{self.distribution}"
+        shape = self._shape_name()
+        if self.strategy == 'uniform':
+            return shape
+        if self.strategy == 'censoring':
+            # The clipped fraction IS the level here, so the name is only
+            # complete once a level has been injected. `_inject_censoring`
+            # sets it, deriving the percentage from the level it was given.
+            return 'censoring'
+        if self.strategy == 'outlier':
+            p = self.params.get('p')
+            base = 'outlier' if p is None else f"outlier_p{int(round(float(p) * 100)):02d}"
+        else:
+            base = self.strategy
+        return base if self.distribution == 'gaussian' else f"{base}_{shape}"
 
     @condition.setter
     def condition(self, value):
@@ -510,24 +540,53 @@ class NoiseInjectorRegression:
         solved = dose / g
 
         if self.strategy == 'grouped_shifted':
-            epsilon = self._draw_grouped_shifted(y, dose, groups, **params)
+            # `solved`, not `dose`. Both parts of the offset are drawn at the
+            # shape's OWN spread, exactly like every other condition, so they
+            # take the solved scale like every other condition. Passing the
+            # target instead delivered sqrt 2 times too much under Laplace and
+            # sqrt(5/3) under Student-t; Gaussian has unit spread, which is why
+            # the registry never showed it.
+            epsilon = self._draw_grouped_shifted(y, solved, groups, **params)
             noise_scale = np.full(n, dose)
         else:
             epsilon = self._draw_shape(n, **params) * (solved * scales)
             noise_scale = solved * scales * self._shape_unit_sd(**params)
 
+        # How much was actually delivered, CHECKED rather than merely recorded.
+        # The Rust injector has aborted on this since it was written
+        # (`rust/src/main.rs`, the dose gate); the Python one wrote the realised
+        # dose into the provenance and never looked at it, which is how the
+        # grouped-shifted scale above stayed wrong through every run. The band
+        # is `dose_tolerance`, the twin of the Rust function, worked out from
+        # this draw's own fourth moment and its effective size -- so a heavy
+        # tail or a group-level term widens it on its own and this catches
+        # breakage rather than sampling. Censoring is swept on its own axis and
+        # has no target amount, so it returned above without reaching here.
+        effective_n = self._effective_n(n, scales, params, n_groups, groups=groups)
+        realised = float(np.sqrt(np.mean(epsilon ** 2)))
+        tol = dose_tolerance(epsilon, effective_n,
+                             nu=params.get('nu', self.params.get('nu')))
+        if abs(realised / dose - 1.0) > tol:
+            raise RuntimeError(
+                f"{self.condition} delivered {realised:.6f} against a target of "
+                f"{dose:.6f} ({100 * (realised / dose - 1.0):+.2f}%), outside the "
+                f"{100 * tol:.2f}% band that {effective_n:.0f} effective "
+                f"observations allow")
+
         return self._result(y, epsilon, noise_scale, dose, unit_dose=g,
                             solved_scale=solved, affected=affected,
                             n_groups=n_groups, largest_share=largest_share,
-                            params=params, scales=scales, groups=groups)
+                            params=params, scales=scales, groups=groups,
+                            effective_n=effective_n)
 
-    def _draw_grouped_shifted(self, y, dose, groups, **params):
+    def _draw_grouped_shifted(self, y, scale, groups, **params):
         """Group-level offset plus a within-molecule error.
 
-            eps_i = sqrt(rho)*tau*b_g(i) + sqrt(1-rho)*tau*e_i
+            eps_i = sqrt(rho)*s*b_g(i) + sqrt(1-rho)*s*e_i
 
-        The two variances sum to tau^2 by construction, so the condition is
-        dose-matched without a solver step. rho is the share of total variance
+        b and e are draws from the shape at its own spread, and `s` is the
+        solved scale the dose solver returned, so the two variances sum to the
+        target by construction. rho is the share of total variance
         carried by the group-level term: 0.62, from Bentz et al. (2013) Table 7,
         where the laboratory term carries 62% of the variance in log efflux
         ratio across 23 laboratories.
@@ -543,7 +602,7 @@ class NoiseInjectorRegression:
         uniq, inverse = np.unique(groups, return_inverse=True)
         b = self._draw_shape(len(uniq), **params)
         e = self._draw_shape(len(y), **params)
-        return dose * (math.sqrt(rho) * b[inverse] + math.sqrt(1.0 - rho) * e)
+        return scale * (math.sqrt(rho) * b[inverse] + math.sqrt(1.0 - rho) * e)
 
     def _inject_censoring(self, y, ref, n_groups, largest_share, **params):
         """Clip values past an assay limit to the limit itself.

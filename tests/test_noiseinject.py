@@ -6,6 +6,8 @@ Covers the core injection/calibration/metrics paths plus a regression test for t
 `binary_asymmetric` copy-assignment bug (it previously flipped zero labels).
 """
 
+import sys
+
 import numpy as np
 import pytest
 
@@ -33,6 +35,44 @@ DOSE_MATCHED = [c for c, spec in CONDITIONS.items() if spec['strategy'] != 'cens
 CENSORING = [c for c, spec in CONDITIONS.items() if spec['strategy'] == 'censoring']
 # For censoring the LEVEL is the fraction clipped, not a dose.
 CENSORING_LEVEL = 0.25
+
+# The shape is a SECOND axis for grouped-shifted, and it has to be, because the
+# registry pins every condition to Gaussian. A Gaussian draw has spread 1, so a
+# scale applied at the shape's own spread and a scale applied at the solved one
+# come out identical, and the dose check above cannot tell them apart. Laplace
+# has spread sqrt 2 and Student-t at nu=5 has sqrt(5/3), which separates them:
+# on this axis the old code delivered 1.51x and 1.19x what was asked.
+GROUPED_SHIFTED_SHAPES = [
+    dict(distribution='gaussian'),
+    dict(distribution='laplace'),
+    dict(distribution='student_t', nu=5.0),
+]
+DOSE_MATCHED_CASES = (
+    [(c, None) for c in DOSE_MATCHED]
+    + [('grouped_shifted', shape) for shape in GROUPED_SHIFTED_SHAPES]
+)
+
+
+def _case_id(case):
+    condition, shape = case
+    if shape is None:
+        return condition
+    nu = f"_nu{shape['nu']:g}" if 'nu' in shape else ''
+    return f"{condition}-{shape['distribution']}{nu}"
+
+
+def _injector(condition, shape, seed):
+    """A registry condition, optionally with its shape swapped for another.
+
+    The registry itself stays Gaussian -- that is what the study runs. This is
+    the test reaching past it to the axis the registry does not cover.
+    """
+    if shape is None:
+        return NoiseInjectorRegression.from_condition(condition, random_state=seed)
+    spec = {k: v for k, v in CONDITIONS[condition].items()
+            if k not in ('strategy', 'distribution', 'nu')}
+    return NoiseInjectorRegression(strategy=CONDITIONS[condition]['strategy'],
+                                   random_state=seed, **spec, **shape)
 
 
 def _labels(n=20000, seed=0):
@@ -68,8 +108,8 @@ def test_invalid_strategy_raises():
         NoiseInjectorRegression.from_condition('legacy')      # deleted in 1.0.0
 
 
-@pytest.mark.parametrize('condition', DOSE_MATCHED)
-def test_dose_is_flat_across_conditions(condition):
+@pytest.mark.parametrize('case', DOSE_MATCHED_CASES, ids=_case_id)
+def test_dose_is_flat_across_conditions(case):
     """THE check. Every condition delivers the requested amount, not its own.
 
     The tolerance is DERIVED per condition from its fourth moment and its
@@ -77,10 +117,11 @@ def test_dose_is_flat_across_conditions(condition):
     hand-kept. A list of "unstable conditions" would need editing every time a
     condition is added, and would silently stop covering the new one.
     """
+    condition, shape = case
     y, g = _labels(), _groups()
     tau = 0.5 * y.std()
-    runs = [NoiseInjectorRegression.from_condition(condition, random_state=seed).inject_verbose(
-        y, tau, groups=g) for seed in range(20)]
+    runs = [_injector(condition, shape, seed).inject_verbose(y, tau, groups=g)
+            for seed in range(20)]
 
     # 1. The solved scale hits the target EXACTLY -- this part is arithmetic,
     #    and it is the half of the gate that does not depend on a draw.
@@ -95,10 +136,41 @@ def test_dose_is_flat_across_conditions(condition):
     mean_dose = float(np.mean([r.realised_dose_label_units for r in runs]))
     r0 = runs[0]
     tol = dose_tolerance(r0.epsilon, r0.effective_n,
-                         nu=CONDITIONS[condition].get('nu')) / np.sqrt(len(runs))
+                         nu=(shape or CONDITIONS[condition]).get('nu')) / np.sqrt(len(runs))
     assert mean_dose == pytest.approx(tau, rel=max(tol, 0.002)), (
-        f"{condition}: asked for {tau:.4f}, delivered {mean_dose:.4f} on average"
+        f"{_case_id(case)}: asked for {tau:.4f}, delivered {mean_dose:.4f} on average"
         f" (tolerance {100 * tol:.2f}%, effective n {r0.effective_n:.0f})")
+
+
+def test_the_delivered_dose_is_checked_not_just_recorded():
+    """The injector must REFUSE to hand back an amount it was not asked for.
+
+    Every field of the provenance was written and nothing ever read it back, so
+    grouped-shifted delivered up to 1.51x its target under a heavy tail for the
+    life of the project without a single check going red. The Rust injector has
+    aborted on this since it was written; this is its Python twin.
+
+    The draw is scaled behind the injector's back, which is the only way to
+    produce a wrong amount once the code is right -- the point is that the
+    guard exists and fires, not that any condition still miscalibrates.
+    """
+    y, g = _labels(5000), _groups(5000)
+    for condition in DOSE_MATCHED:
+        inj = NoiseInjectorRegression.from_condition(condition, random_state=0)
+        honest = inj._draw_shape
+        inj._draw_shape = lambda n, _f=honest, **kw: 2.0 * _f(n, **kw)
+        with pytest.raises(RuntimeError, match='outside the'):
+            inj.inject_verbose(y, 0.4, groups=g)
+
+
+def test_censoring_is_exempt_from_the_dose_check():
+    """Censoring is swept on the fraction clipped, not on an amount, so there
+    is no target for a delivered amount to be compared against."""
+    y, g = _labels(5000), _groups(5000)
+    r = NoiseInjectorRegression.from_condition('censoring', random_state=0).inject_verbose(
+        y, CENSORING_LEVEL, groups=g)
+    assert np.isnan(r.target_dose_label_units)
+    assert r.realised_dose_label_units > 0
 
 
 def test_zero_dose_records_exactly_zero():
@@ -582,3 +654,9 @@ def test_gauche_gp_wrapper_rbf_fits_and_predicts():
     mean, std = gp.predict(X[:10])
     assert mean.shape == (10,) and std.shape == (10,)
     assert np.all(std > 0)
+
+
+if __name__ == '__main__':
+    # Runnable as a plain script so `scripts/check_fixes_fail_when_removed.py`
+    # in qsar_qm_models can point at a path and pass `-k` through.
+    raise SystemExit(pytest.main([__file__, '-q'] + sys.argv[1:]))
