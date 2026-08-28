@@ -393,6 +393,71 @@ def test_censoring_clips_the_requested_fraction_and_nothing_else():
     assert np.isnan(r.unit_dose_g) and np.isnan(r.target_dose_label_units)   # not dose-matched
 
 
+def test_grouped_wider_refuses_to_inject_when_it_selected_nobody():
+    """A grouped condition that hit no molecule is not that condition.
+
+    The families are chosen on `reference_groups` and looked up among `groups`.
+    When the two share no family -- which a scaffold split guarantees, and the
+    experimental runner raises if it is ever untrue -- the lookup matches
+    nothing and every molecule takes the ordinary width. The dose is still
+    delivered and the row still says grouped_wider, so nothing downstream can
+    tell it apart from plain noise. It has to fail loudly instead.
+    """
+    y_train, g_train = _labels(3000), _groups(3000, n_groups=150, seed=1)
+    y_val = _labels(800, seed=7)
+    g_val = _groups(800, n_groups=40, seed=2) + 10_000      # no family in common
+    assert not (set(np.unique(g_train)) & set(np.unique(g_val)))
+
+    inj = NoiseInjectorRegression.from_condition('grouped_wider', random_state=0)
+    with pytest.raises(ValueError, match='selected no molecule'):
+        inj.inject_verbose(y_val, 0.5, groups=g_val,
+                           reference=y_train, reference_groups=g_train)
+
+
+def test_grouped_wider_draws_its_own_families_for_a_separate_split():
+    """Omitting reference_groups gives a real grouped pattern, at the same rate.
+
+    This is what the validation labels get. The selection is drawn over the
+    split's own families, so it is a genuine grouped condition there rather
+    than plain noise, and it targets the same molecule fraction training does.
+    """
+    y_val = _labels(800, seed=7)
+    g_val = _groups(800, n_groups=40, seed=2)
+    y_train = _labels(3000)
+    g_train = _groups(3000, n_groups=150, seed=1)
+
+    inj = NoiseInjectorRegression.from_condition('grouped_wider', random_state=0)
+    val = inj.inject_verbose(y_val, 0.5, groups=g_val, reference=y_train)
+    train = inj.inject_verbose(y_train, 0.5, groups=g_train)
+
+    # Two distinct widths, not one: the condition actually did something.
+    assert len(np.unique(np.round(val.noise_scale, 12))) == 2
+    # Same targeted molecule fraction on both splits.
+    assert val.affected_molecule_fraction == pytest.approx(
+        train.affected_molecule_fraction, abs=0.08)
+    # Whole families, never part of one.
+    for gid in np.unique(g_val):
+        widths = np.unique(np.round(val.noise_scale[g_val == gid], 12))
+        assert len(widths) == 1, f'family {gid} was split across two widths'
+
+
+def test_grouped_wider_pattern_on_held_out_molecules_stays_flat():
+    """Describing a pattern is not applying one, and they must not move together.
+
+    A held-out molecule's region was exposed to a flat pattern when whole
+    families are held out, and that is the truth the scoring needs. The guard
+    above must not reach this path.
+    """
+    y_train, g_train = _labels(3000), _groups(3000, n_groups=150, seed=1)
+    y_test = _labels(800, seed=7)
+    g_test = _groups(800, n_groups=40, seed=2) + 10_000
+
+    inj = NoiseInjectorRegression.from_condition('grouped_wider', random_state=0)
+    pattern = inj.noise_scale(y_test, 1.0, reference=y_train,
+                              groups=g_test, reference_groups=g_train)
+    assert len(np.unique(np.round(pattern, 12))) == 1
+
+
 def test_censoring_counts_the_requested_fraction_on_a_coarse_assay():
     """A coarsely recorded assay puts a block of labels exactly on the cut.
 

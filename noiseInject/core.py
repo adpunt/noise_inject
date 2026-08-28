@@ -562,6 +562,38 @@ class NoiseInjectorRegression:
 
         scales, affected = self.scale_map(y, groups=groups,
                                          reference_groups=reference_groups, **params)
+        # A GROUPED CONDITION THAT SELECTED NOBODY IS NOT THAT CONDITION.
+        #
+        # `grouped_wider` chooses whole scaffold families and widens them. When
+        # the caller passes `reference_groups`, the choice is made on THOSE
+        # families and looked up here by group id. If the labels being injected
+        # come from a split that shares no family with the reference -- which is
+        # what a scaffold split guarantees, and the experimental runner raises if
+        # it is ever untrue -- the lookup matches nothing, every molecule takes a
+        # scale of 1.0, and the result is plain noise wearing a grouped name. It
+        # is silent: the dose is still delivered, the row still says
+        # `grouped_wider`, and nothing downstream can tell.
+        #
+        # That is exactly what happened to the validation labels the four neural
+        # families stop training against, on all three experimental datasets.
+        #
+        # Describing a pattern is different from applying one and must stay
+        # different: `noise_scale()` legitimately returns a flat map for held-out
+        # molecules, because the pattern their region was exposed to IS flat when
+        # whole families are held out. That path does not come through here. This
+        # check guards INJECTION only.
+        if (self.strategy == 'grouped_wider' and reference_groups is not None
+                and affected == 0.0):
+            raise ValueError(
+                f"{self.condition} selected no molecule to widen. The affected "
+                f"families were chosen on `reference_groups` and none of them "
+                f"appears in `groups`, so this would inject plain noise under a "
+                f"grouped name. If these labels are a separate split -- "
+                f"validation, say -- omit `reference_groups` so the selection is "
+                f"drawn over their own families at the same molecule fraction. "
+                f"Keep `reference` either way: it fixes the cut-point and is a "
+                f"different argument. To DESCRIBE the pattern a held-out molecule "
+                f"was exposed to, rather than apply one, call noise_scale().")
         g = self.unit_dose(scales, **params)
         solved = dose / g
 
