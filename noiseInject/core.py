@@ -680,11 +680,64 @@ class NoiseInjectorRegression:
         # unlike the zero-mean conditions this is a deterministic function of
         # the label, which is what makes censoring the label-keyed condition.
         noise_scale = np.abs(epsilon)
+        censored = self._censored_set(y, ref, limit, frac, side)
         return self._result(y, epsilon, noise_scale, target_dose=float('nan'),
                             unit_dose=float('nan'), solved_scale=float('nan'),
-                            affected=float((epsilon != 0).mean()),
+                            affected=float(censored.mean()),
                             n_groups=n_groups, largest_share=largest_share,
                             params=params, censoring_limit=limit)
+
+    @staticmethod
+    def _censored_set(y, ref, limit, frac, side):
+        """Which molecules count as censored. Changes no label, only the count.
+
+        WHY THIS IS NOT A COMPARISON AGAINST THE LIMIT
+        ----------------------------------------------
+        The count used to be "how many labels the clip actually MOVED", which is
+        `y > limit`. On a coarsely recorded assay a block of labels sits exactly
+        ON the limit; clipping leaves them where they are, so they were never
+        counted. LogD is recorded to one decimal place -- 72 distinct values
+        across 5,039 molecules -- and asking for 10% clipped moved 8.57%.
+
+        Widening it to `y >= limit` is worse, not better, and this was measured
+        rather than argued. It swings from excluding the whole tie block to
+        including all of it, and the requested fraction lies inside the block:
+
+            asked   y > limit   y >= limit
+             10%       8.57%       10.14%
+             20%      19.88%       22.15%
+             25%      24.69%       27.29%
+             40%      39.39%       42.83%
+             50%      49.39%       52.93%
+
+        so at four of the five levels the wider rule misses by MORE. No single
+        value can separate the tie block, in either direction.
+
+        THE RULE
+        --------
+        On the reference labels -- the training set, whose distribution defines
+        the assay limit -- the censored set is the top `k = round(frac * n)` by
+        rank, ties broken by position. That is exactly the requested fraction at
+        every level, by construction, and it changes no label: the k-th largest
+        value IS the quantile cut on every dataset measured, so the same
+        molecules are clipped to the same value as before.
+
+        On any other split the limit is a fixed property of the assay, so the
+        censored set is whatever sits at or past it. A held-out set does not get
+        the same fraction censored as training, and it should not: that is the
+        measurement, not an error.
+        """
+        n = len(y)
+        if frac <= 0.0 or n == 0:
+            return np.zeros(n, dtype=bool)
+        on_reference = (ref.shape == y.shape and np.array_equal(ref, y))
+        if on_reference:
+            k = int(round(frac * n))
+            order = np.argsort(-y if side == 'upper' else y, kind='stable')
+            censored = np.zeros(n, dtype=bool)
+            censored[order[:k]] = True
+            return censored
+        return (y >= limit) if side == 'upper' else (y <= limit)
 
     def _result(self, y, epsilon, noise_scale, target_dose, unit_dose,
                 solved_scale, affected, n_groups, largest_share, params,

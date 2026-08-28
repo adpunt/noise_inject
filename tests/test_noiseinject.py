@@ -393,6 +393,85 @@ def test_censoring_clips_the_requested_fraction_and_nothing_else():
     assert np.isnan(r.unit_dose_g) and np.isnan(r.target_dose_label_units)   # not dose-matched
 
 
+def test_censoring_counts_the_requested_fraction_on_a_coarse_assay():
+    """A coarsely recorded assay puts a block of labels exactly on the cut.
+
+    This is the LogD case and it is the reason the count changed. LogD is
+    recorded to one decimal place -- 72 distinct values across 5,039 molecules
+    -- so at every level on the censoring axis a large block of labels sits
+    exactly at the limit. Clipping does not move them, so counting only the
+    moved labels reported 8.57% for a requested 10%.
+
+    Widening the comparison to `y >= limit` is worse, not better: it includes
+    the whole tie block where the old rule excluded it, and the requested
+    fraction lies inside the block. Measured on the real LogD labels, it misses
+    by MORE at four of the five levels on the axis. So the censored set on the
+    reference labels is the top k by rank instead, which is exact by
+    construction and clips exactly the molecules the old rule clipped.
+
+    The continuous fixture in the test above cannot see any of this: with no
+    ties, "past the limit" and "moved" are the same set.
+    """
+    rng = np.random.RandomState(0)
+    y = np.round(rng.normal(3.0, 1.1, 8000), 1)          # one decimal, like LogD
+    assert len(np.unique(y)) < len(y) / 50, 'the fixture is not coarse enough to test this'
+
+    for frac in (0.10, 0.20, 0.25, 0.40):
+        # The registry name is bare `censoring`; the level is the dose.
+        r = NoiseInjectorRegression.from_condition(
+            'censoring', random_state=0).inject_verbose(y, frac)
+        limit = r.censoring_limit
+
+        # Exact, at every level. This is the whole point of the rank rule.
+        assert r.affected_molecule_fraction == pytest.approx(frac, abs=1e-9)
+
+        # The tie block is real, so a value comparison could not have got here.
+        moved = float((r.epsilon != 0).mean())
+        at_or_past = float((y >= limit).mean())
+        assert moved < frac < at_or_past, (
+            f'at {frac:.0%} the fixture has no tie block straddling the limit, '
+            f'so this test is not exercising what it was written for')
+
+        # Not one label moved differently. Only the count changed.
+        assert np.all(r.y_noisy <= limit + 1e-9)
+        untouched = r.epsilon == 0
+        assert np.all(r.y_noisy[untouched] == y[untouched])
+
+
+def test_censoring_on_a_held_out_split_uses_the_training_limit():
+    """A held-out set does not get the requested fraction censored, and should not.
+
+    The assay limit is a property of the assay: it is read off the training
+    labels and applied unchanged everywhere. The rank rule applies only where
+    the labels ARE the reference; anywhere else the count is whatever sits at or
+    past that fixed value.
+    """
+    rng = np.random.RandomState(0)
+    y_train = np.round(rng.normal(3.0, 1.1, 4000), 1)
+    y_test = np.round(rng.normal(3.6, 1.1, 1500), 1)     # shifted upwards
+
+    inj = NoiseInjectorRegression.from_condition('censoring', random_state=0)
+    train = inj.inject_verbose(y_train, 0.20)
+    test = inj.inject_verbose(y_test, 0.20, reference=y_train)
+
+    assert train.affected_molecule_fraction == pytest.approx(0.20, abs=1e-9)
+    assert test.censoring_limit == pytest.approx(train.censoring_limit)
+    # The test labels sit higher, so more of them are past the same limit.
+    assert test.affected_molecule_fraction > 0.20
+
+
+def test_censoring_at_level_zero_reports_nothing_censored():
+    """Level 0 is the clean reference and must report a zero fraction.
+
+    Counting the censored SET rather than the moved set would otherwise call
+    every label at or above a zero-width limit censored.
+    """
+    y = _labels(2000)
+    r = NoiseInjectorRegression.from_condition('censoring', random_state=0).inject_verbose(y, 0.0)
+    assert r.affected_molecule_fraction == 0.0
+    assert np.all(r.epsilon == 0)
+
+
 def test_censoring_scores_held_out_molecules_against_the_training_limit():
     """The cut-point comes from the TRAINING labels, or held-out molecules are
     scored against a distribution they were never exposed to."""
