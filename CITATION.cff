@@ -6,7 +6,7 @@ authors:
     # orcid: "https://orcid.org/0000-0000-0000-0000"  # TODO: add your ORCID
     affiliation: University of Oxford
 title: "NoiseInject: A Framework for Label Noise Robustness Testing"
-version: 0.3.0
+version: 1.0.0
 doi: "10.5281/zenodo.20532710"
 date-released: 2026-06-03
 url: "https://github.com/adpunt/noise_inject"

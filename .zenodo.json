@@ -1,6 +1,6 @@
 {
   "title": "NoiseInject: A Framework for Label Noise Robustness Testing",
-  "description": "A lightweight Python framework for testing machine-learning model robustness to label noise in both regression (continuous noise) and classification (label flips) tasks, with calibration for fair strategy comparison and noise-sensitivity metrics.",
+  "description": "A lightweight Python framework for testing machine-learning model robustness to label noise in both regression (continuous noise) and classification (label flips) tasks, with calibration for fair strategy comparison and a retention-curve robustness metric (normalised retention AUC).",
   "upload_type": "software",
   "license": "MIT",
   "creators": [
