@@ -95,14 +95,31 @@ def dose_tolerance(epsilon, effective_n, nu=None):
     a condition is added, and would silently stop covering the new one.
 
     Three standard errors, floored at the half a percent the design quotes for
-    the full QM9 label column. Student-t at nu <= 4 gets a flat 15%: its fourth
-    moment is infinite, so the sample kurtosis this is computed from is itself
-    meaningless.
+    the full QM9 label column.
+
+    Student-t at nu <= 4 has NO fourth moment, so the sample kurtosis below does
+    not converge and cannot be used. It used to get a flat 15% at every sample
+    size, which is the only band here that did not shrink as the sample grew --
+    far too tight on the splits the jobs run (measured on the Rust side, 200
+    draws at nu = 3 and level 0.5: 21 of 200 outside the band at 1,000 labels)
+    and far too loose on a full label column. Settled by the author 2026-08-29:
+    make it shrink.
+
+    The rate is not one over the square root of the count. For 2 < nu < 4 the
+    sample second moment is in the domain of attraction of a stable law of index
+    nu/2, so it converges at n**(1 - 2/nu), and the root-mean-square inherits
+    that; the exponent returns to the ordinary square-root rate exactly at
+    nu = 4. The constant is CALIBRATED rather than chosen: at nu = 3 and 1,000
+    labels the measured spread of the delivered amount is 13%, which fixes it at
+    1.3, and the same rule predicts 3.3% at 60,000 labels against 4.0% measured.
 
     Matches `dose_tolerance` in `rust/src/main.rs`.
     """
+    HEAVY_TAIL_SE_AT_UNIT_N = 1.3
     if nu is not None and float(nu) <= 4.0:
-        return 0.15
+        n_eff = max(float(effective_n), 1.0)
+        se = HEAVY_TAIL_SE_AT_UNIT_N * n_eff ** (2.0 / float(nu) - 1.0)
+        return max(3.0 * se, 0.005)
     epsilon = np.asarray(epsilon, dtype=float)
     n_eff = max(float(effective_n), 1.0)
     m2 = float(np.mean(epsilon ** 2))
