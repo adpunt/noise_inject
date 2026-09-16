@@ -160,7 +160,7 @@ def calculate_noise_metrics(
             from .core import NoiseInjectorRegression
             injector = NoiseInjectorRegression()
             row['effective_noise'] = injector.get_effective_noise(
-                y_true, y_noisy_dict[sigma], method='std_normalized'
+                y_true, y_noisy_dict[sigma], method='rms_normalized'
             )
         
         results.append(row)

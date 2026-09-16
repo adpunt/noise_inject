@@ -1221,3 +1221,4 @@ class NoiseInjectorClassification:
             cls_flip_rate = np.mean(y_clean[cls_mask] != y_noisy[cls_mask])
             per_class_rates[cls] = cls_flip_rate
         
+        return per_class_rates
