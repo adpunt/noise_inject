@@ -259,6 +259,47 @@ def test_conditions_are_distinguishable_at_matched_dose():
     assert frac['grouped_wider'] > 3 * frac['gaussian']
 
 
+def test_outlier_only_leaves_the_unselected_labels_exactly_alone():
+    """The two outlier families differ in who moves, not in how much noise lands.
+
+    Under `outlier_p10` the multiplier is 3.0 on the selected tenth and 1.0 on
+    the rest, so every label moves and the selected tenth carries only part of
+    the injected error. Under `outlier_only_p10` the multiplier on the rest is
+    0.0, so the molecules the mask names are the only ones whose label changed.
+
+    That difference is the whole point of the pair: it separates "a detector
+    cannot find the corrupted molecules" from "finding them does not help".
+    """
+    y = _labels(4000)
+    tau = 0.5 * y.std()
+
+    moved, share = {}, {}
+    for condition in ('outlier_p10', 'outlier_only_p10'):
+        r = NoiseInjectorRegression.from_condition(condition, random_state=5).inject_verbose(y, tau)
+        assert r.condition == condition
+        eps = np.asarray(r.epsilon)
+        widened = np.asarray(r.noise_scale) >= np.asarray(r.noise_scale).max() - 1e-12
+        moved[condition] = float(np.mean(np.abs(eps) > 1e-12))
+        share[condition] = float((eps[widened] ** 2).sum() / (eps ** 2).sum())
+
+    assert moved['outlier_p10'] == 1.0
+    assert 0.05 < moved['outlier_only_p10'] < 0.15
+    # 0.10*9 / (0.10*9 + 0.90) = one half, fixed by p and lam.
+    assert 0.35 < share['outlier_p10'] < 0.65
+    assert share['outlier_only_p10'] > 0.999
+
+
+def test_outlier_only_carries_its_own_name():
+    """The two families must not share a results-row name."""
+    for p, expect in ((0.01, 'outlier_only_p01'), (0.05, 'outlier_only_p05'),
+                      (0.10, 'outlier_only_p10')):
+        inj = NoiseInjectorRegression(strategy='outlier', distribution='gaussian',
+                                      p=p, lam=3.0, base=0.0, random_state=0)
+        assert inj.condition == expect
+        assert NoiseInjectorRegression(strategy='outlier', distribution='gaussian',
+                                       p=p, lam=3.0, random_state=0).condition != expect
+
+
 # --- the two grouped conditions ---------------------------------------------
 
 def test_grouped_requires_a_group_assignment():

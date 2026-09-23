@@ -71,6 +71,20 @@ CONDITIONS: Dict[str, Dict[str, Any]] = {
     # a "level 0" run would then still clip -- so the clean baseline would not be
     # clean. The reported name is derived from the level, as `censoring_25`.
     'censoring':       dict(strategy='censoring',       distribution='gaussian', side='upper'),
+    # ADDED 2026-09-23. The same outlier mechanism with the UNSELECTED
+    # molecules left alone -- base=0.0 rather than the 1.0 above. Under
+    # outlier_p* every label moves and the mask names only the widened
+    # fraction, so an oracle removing exactly the named molecules leaves behind
+    # the share of variance the rest carry: half of it at p=0.10, and more at
+    # smaller p. Here the mask names every molecule that moved, so the oracle
+    # can reach all of the injected error.
+    #
+    # Both belong in the sweep. The pair is what separates "a detector cannot
+    # find the corrupted molecules" from "finding them does not help", which
+    # every null result in this suite so far has been unable to tell apart.
+    'outlier_only_p01': dict(strategy='outlier', distribution='gaussian', p=0.01, lam=3.0, base=0.0),
+    'outlier_only_p05': dict(strategy='outlier', distribution='gaussian', p=0.05, lam=3.0, base=0.0),
+    'outlier_only_p10': dict(strategy='outlier', distribution='gaussian', p=0.10, lam=3.0, base=0.0),
 }
 
 REGRESSION_STRATEGIES = ('uniform', 'grouped_wider', 'grouped_shifted', 'outlier', 'censoring')
@@ -84,8 +98,12 @@ REGRESSION_DISTRIBUTIONS = ('gaussian', 'student_t', 'laplace')
 _CONSTANT_SCALE_STRATEGIES = ('uniform', 'grouped_shifted')
 
 
-def dose_tolerance(epsilon, effective_n, nu=None):
+def dose_tolerance(shape, effective_n, nu=None):
     """How close the realised dose can be expected to land, for THIS condition.
+
+    `shape` is the UNSCALED draw, not the delivered noise. The scale map's
+    unevenness belongs to `effective_n` and to nothing else; see the note at the
+    call site.
 
     Derived, not hand-kept. The sampling spread of a root-mean-square estimate
     depends on the fourth moment and on how many independent contributions it is
@@ -120,10 +138,10 @@ def dose_tolerance(epsilon, effective_n, nu=None):
         n_eff = max(float(effective_n), 1.0)
         se = HEAVY_TAIL_SE_AT_UNIT_N * n_eff ** (2.0 / float(nu) - 1.0)
         return max(3.0 * se, 0.005)
-    epsilon = np.asarray(epsilon, dtype=float)
+    shape = np.asarray(shape, dtype=float)
     n_eff = max(float(effective_n), 1.0)
-    m2 = float(np.mean(epsilon ** 2))
-    m4 = float(np.mean(epsilon ** 4))
+    m2 = float(np.mean(shape ** 2))
+    m4 = float(np.mean(shape ** 4))
     kurtosis = min(max(m4 / (m2 * m2), 3.0), 60.0) if m2 > 0 else 3.0
     se = math.sqrt((kurtosis - 1.0) / (4.0 * n_eff))
     return max(3.0 * se, 0.005)
@@ -333,7 +351,11 @@ class NoiseInjectorRegression:
             return 'censoring'
         if self.strategy == 'outlier':
             p = self.params.get('p')
-            base = 'outlier' if p is None else f"outlier_p{int(round(float(p) * 100)):02d}"
+            # `base` is the multiplier on the molecules the selection did not
+            # pick. At the default 1.0 their labels still move, so the two
+            # families are different noise and must not share a name.
+            stem = 'outlier' if float(self.params.get('base', 1.0)) else 'outlier_only'
+            base = stem if p is None else f"{stem}_p{int(round(float(p) * 100)):02d}"
         else:
             base = self.strategy
         return base if self.distribution == 'gaussian' else f"{base}_{shape}"
@@ -469,8 +491,14 @@ class NoiseInjectorRegression:
         if self.strategy == 'outlier':
             lam = float(self._param('lam', params))
             p = float(self._param('p', params))
+            # The multiplier on the molecules the selection did NOT pick.
+            # 1.0 keeps the existing behaviour, where every label moves and the
+            # selected fraction is only widened. 0.0 leaves the rest exactly as
+            # they were, so the molecules named by the mask are the only ones
+            # that moved.
+            base = float(self._param('base', params, default=1.0))
             hit = sel.random_sample(n) < p
-            scales = np.where(hit, lam, 1.0)
+            scales = np.where(hit, lam, base)
             return scales, float(hit.mean())
 
         if self.strategy == 'censoring':
@@ -623,9 +651,23 @@ class NoiseInjectorRegression:
             # the registry never showed it.
             epsilon = self._draw_grouped_shifted(y, solved, groups, **params)
             noise_scale = np.full(n, dose)
+            # No per-molecule scale map here, so the delivered amount and the
+            # draw have the same fourth moment.
+            tail_of = epsilon
         else:
-            epsilon = self._draw_shape(n, **params) * (solved * scales)
+            shape = self._draw_shape(n, **params)
+            epsilon = shape * (solved * scales)
             noise_scale = solved * scales * self._shape_unit_sd(**params)
+            # The DRAW, not the delivered amount. How unevenly the scale map
+            # spreads the noise is already in `effective_n` below, which is
+            # (sum s^2)^2 / sum s^4 over the same map; taking the fourth moment
+            # of `epsilon` would count that unevenness a second time. It is only
+            # visible once a scale can be zero: at outlier_only_p01, 63 of 5,000
+            # molecules carry the whole amount, and the doubled-draw test that
+            # every other condition trips stayed silent because the band had
+            # opened to 145% where 27% is what 63 independent contributions
+            # allow. The rust port carries the same expression.
+            tail_of = shape
 
         # How much was actually delivered, CHECKED rather than merely recorded.
         # The Python injector wrote the realised amount into the provenance and
@@ -648,7 +690,7 @@ class NoiseInjectorRegression:
         # target amount, so it returned above without reaching here.
         effective_n = self._effective_n(n, scales, params, n_groups, groups=groups)
         realised = float(np.sqrt(np.mean(epsilon ** 2)))
-        tol = dose_tolerance(epsilon, effective_n,
+        tol = dose_tolerance(tail_of, effective_n,
                              nu=params.get('nu', self.params.get('nu')))
         if abs(realised / dose - 1.0) > tol:
             warnings.warn(
