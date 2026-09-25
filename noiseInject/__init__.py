@@ -15,6 +15,14 @@ from .core import (
     REGRESSION_DISTRIBUTIONS,
 )
 
+from .relative import (
+    # Conditions sized in a caller-supplied unit (e.g. a model's residual SD)
+    RelativeNoiseInjector,
+    RelativeInjectionResult,
+    RELATIVE_CONDITIONS,
+    RELATIVE_SPARSE_SHARES,
+)
+
 from .calibration import (
     # Classification calibration. Regression needs none: every condition
     # solves for its own scale in closed form -- see NOISE_DESIGN.md section 1.
@@ -48,6 +56,11 @@ __all__ = [
     'CONDITIONS',
     'REGRESSION_STRATEGIES',
     'REGRESSION_DISTRIBUTIONS',
+    # Conditions sized in a caller-supplied unit
+    'RelativeNoiseInjector',
+    'RelativeInjectionResult',
+    'RELATIVE_CONDITIONS',
+    'RELATIVE_SPARSE_SHARES',
     # Classification calibration
     'calibrate_flip_probability',
     'calibrate_multiple_flip_probabilities',

@@ -112,6 +112,39 @@ the check exists to catch: the defect it was written for was a fixed scale error
 fatal; nothing in this package raises it. Censoring is exempt from the check
 altogether: it is swept on the fraction of labels clipped and has no target amount.
 
+### Regression, sized in a unit you supply
+
+`RelativeNoiseInjector` takes a **level** and a **unit** instead of a dose. The unit
+is any scale in label units the caller wants the noise measured against — for
+example the SD of a model's out-of-fold residual on the clean training labels, so
+noise is sized against the error the model already makes. Computing the unit is the
+caller's job; the package only draws the noise.
+
+`RELATIVE_CONDITIONS`:
+- **dense_oofmse**: every label gets N(0, level × unit²)
+- **sparse_dprime_p02 / p05 / p10**: 2 / 5 / 10% of labels shifted by level × unit, random sign
+- **sparse_dprime_up_p02 / p05 / p10**: the same, every shift upwards
+- **hetero_seen**: Gaussian noise whose SD is proportional to a per-molecule covariate you
+  pass as `heavy_atoms` (e.g. heavy-atom count)
+- **hetero_hidden**: Gaussian noise whose SD is a per-molecule lognormal(0, 1) draw
+
+Both hetero conditions are scaled so the mean injected variance is level × unit², as
+for dense_oofmse.
+
+```python
+from noiseInject import RelativeNoiseInjector
+
+inj = RelativeNoiseInjector.from_condition('sparse_dprime_p05', random_state=42)
+res = inj.inject_verbose(y_train, level=2.0, unit=resid_sd)
+res.y_noisy, res.moved_mask, res.as_row()
+```
+
+Seeding follows `NoiseInjectorRegression`: `random_state` seeds the noise draws
+(Gaussian values, the sign of each sparse shift); `selection_state` (default
+`random_state`) seeds which labels a sparse condition moves and hetero_hidden's
+per-molecule scale, re-seeded on every call so the selection is the same at every
+level. Level 0 returns the labels unchanged with an empty mask.
+
 ### Classification (label flips)
 - **uniform**: Equal flip probability for all
 - **class_imbalance**: Varies by class frequency

@@ -863,3 +863,29 @@ if __name__ == '__main__':
     # Runnable as a plain script so `scripts/check_fixes_fail_when_removed.py`
     # in qsar_qm_models can point at a path and pass `-k` through.
     raise SystemExit(pytest.main([__file__, '-q'] + sys.argv[1:]))
+
+
+# --- relative conditions: noise sized in a caller-supplied unit ---------------
+
+from noiseInject import RelativeNoiseInjector, RELATIVE_CONDITIONS
+
+
+@pytest.mark.parametrize("condition", list(RELATIVE_CONDITIONS))
+def test_relative_condition_runs_and_level_zero_moves_nothing(condition):
+    y = _labels(n=500, seed=3)
+    heavy = np.arange(500) % 30 + 5.0
+    unit = 0.7
+    res = RelativeNoiseInjector.from_condition(condition, random_state=11) \
+        .inject_verbose(y, level=2.0, unit=unit, heavy_atoms=heavy)
+    assert res.y_noisy.shape == y.shape
+    assert res.moved_mask.shape == y.shape and res.moved_mask.dtype == bool
+    assert res.moved_mask.any()
+    # only the labels in the mask moved
+    assert np.array_equal(res.y_noisy[~res.moved_mask], y[~res.moved_mask])
+    assert res.as_row()['n_moved'] == int(res.moved_mask.sum())
+    if RELATIVE_CONDITIONS[condition]['kind'] == 'sparse':
+        assert np.allclose(np.abs(res.y_noisy - y)[res.moved_mask], 2.0 * unit)
+    zero = RelativeNoiseInjector.from_condition(condition, random_state=11) \
+        .inject_verbose(y, level=0.0, unit=unit, heavy_atoms=heavy)
+    assert np.array_equal(zero.y_noisy, y)
+    assert not zero.moved_mask.any()
